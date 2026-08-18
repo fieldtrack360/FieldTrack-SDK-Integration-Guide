@@ -9,7 +9,6 @@ every public method, every event and callback.
 | | |
 |---|---|
 | Maven group | `com.github.fieldtrack360.fieldtrack` |
-| version | `v1.0.1-alpha-02` |
 | Distribution | JitPack (`https://jitpack.io`) |
 | `minSdk` | 26 (Android 8.0) |
 | `compileSdk` / `targetSdk` | 37 |
@@ -25,7 +24,7 @@ every public method, every event and callback.
 3. [Quick start](#3-quick-start)
 4. [Permissions](#4-permissions)
 5. [Configuration reference](#5-configuration-reference)
-6. [Public API — `Traker`](#6-public-api--traker)
+6. [Public API — `Tracker`](#6-public-api--traker)
 7. [Events, state and callbacks](#7-events-state-and-callbacks)
 8. [Data models](#8-data-models)
 9. [Plotting and export](#9-plotting-and-export)
@@ -38,7 +37,8 @@ every public method, every event and callback.
 16. [Diagnostics](#16-diagnostics)
 17. [Java interop](#17-java-interop)
 18. [ProGuard / R8](#18-proguard--r8)
-19. [Troubleshooting](#19-troubleshooting)
+19. [Device integrity](#19-device-integrity)
+20. [Troubleshooting](#20-troubleshooting)
 
 ---
 
@@ -177,15 +177,15 @@ or in config, which takes precedence:
 
 ```kotlin
 traker.ready(
-    TrakerConfig.builder()
+    TrackerConfig.builder()
         .license(BuildConfig.FIELDTRACK_LICENSE)
         .build()
 )
 ```
 
-The token is bound to your application id. `ready()` returns a `TrakerResult.Error` with
+The token is bound to your application id. `ready()` returns a `TrackerResult.Error` with
 `LICENSE_MISSING`, `LICENSE_INVALID` or `LICENSE_BUNDLE_MISMATCH` when the check fails, and
-the same failure is emitted on the event flow as `TrakerEvent.Error`.
+the same failure is emitted on the event flow as `TrackerEvent.Error`.
 
 The `license` field is never persisted with the rest of the config.
 
@@ -198,16 +198,16 @@ Three calls: `getInstance` → `ready` → `start`.
 ```kotlin
 class MyApplication : Application() {
 
-    val traker: Traker by lazy { Traker.getInstance(this) }
+    val traker: Tracker by lazy { Tracker.getInstance(this) }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     override fun onCreate() {
         super.onCreate()
         scope.launch {
-            when (val result = traker.ready(TrakerConfig())) {
-                is TrakerResult.Ok    -> Log.d("app", "ready: ${result.value}")
-                is TrakerResult.Error -> Log.w("app", "${result.code}: ${result.message}")
+            when (val result = traker.ready(TrackerConfig())) {
+                is TrackerResult.Ok    -> Log.d("app", "ready: ${result.value}")
+                is TrackerResult.Error -> Log.w("app", "${result.code}: ${result.message}")
             }
         }
     }
@@ -218,8 +218,8 @@ class MyApplication : Application() {
 // After permissions are granted:
 suspend fun begin() {
     when (val result = traker.start(tag = "commute")) {
-        is TrakerResult.Ok    -> Log.d("app", "session ${result.value.id}")
-        is TrakerResult.Error -> Log.w("app", "${result.code}: ${result.message}")
+        is TrackerResult.Ok    -> Log.d("app", "session ${result.value.id}")
+        is TrackerResult.Error -> Log.w("app", "${result.code}: ${result.message}")
     }
 }
 
@@ -239,11 +239,11 @@ val distance = traker.getOdometerMeters()
 
 ### Contract notes
 
-- `Traker.getInstance(context)` is **idempotent and thread-safe** — one instance per process.
+- `Tracker.getInstance(context)` is **idempotent and thread-safe** — one instance per process.
   It retains only the application context, so passing an `Activity` leaks nothing. It is
   cheap: no database is opened and no disk touched until `ready()`.
-- **Nothing on the `Traker` surface throws.** Every fallible call returns `TrakerResult` with a
-  typed `ErrorCode`. The only deliberate exceptions are `TrakerConfig.Builder.build()` and
+- **Nothing on the `Tracker` surface throws.** Every fallible call returns `TrackerResult` with a
+  typed `ErrorCode`. The only deliberate exceptions are `TrackerConfig.Builder.build()` and
   `SyncConfig.Builder.build()`, which fail fast with `IllegalArgumentException` on your own
   thread while you assemble the value. Use `buildUnchecked()` + `validate()` if you prefer to
   read the errors yourself.
@@ -325,11 +325,11 @@ the pipeline, so `CONTINUOUS`/`ADAPTIVE` refuse to start on approximate-only acc
 
 ## 5. Configuration reference
 
-`TrakerConfig` is a `data class` with five nested blocks. Kotlin hosts can use named
-arguments and `copy()`; Java hosts (and anyone who prefers fluency) use `TrakerConfig.builder()`.
+`TrackerConfig` is a `data class` with five nested blocks. Kotlin hosts can use named
+arguments and `copy()`; Java hosts (and anyone who prefers fluency) use `TrackerConfig.builder()`.
 
 ```kotlin
-val config = TrakerConfig.builder()
+val config = TrackerConfig.builder()
     .provider(LocationProviderType.FUSED)
     .accuracyProfile(AccuracyProfile.STRICT)
     .intervalMs(30_000)
@@ -340,7 +340,7 @@ val config = TrakerConfig.builder()
 traker.ready(config)
 ```
 
-### 5.1 Top-level `TrakerConfig`
+### 5.1 Top-level `TrackerConfig`
 
 | Field | Type | Default | What it does |
 |---|---|---|---|
@@ -349,12 +349,13 @@ traker.ready(config)
 | `service` | `ServiceConfig` | defaults | Foreground service, notification, survival |
 | `persistence` | `PersistenceConfig` | defaults | Retention and diagnostic storage |
 | `sensors` | `SensorConfig` | defaults | Hardware motion assists |
+| `security` | `SecurityConfig` | defaults | Device-integrity policy — accessibility, developer mode, hooking frameworks, clock tampering, mock-location apps ([§19](#19-device-integrity)). Waived entirely in debuggable builds |
 | `license` | `String?` | `null` | Release license token. Never persisted |
 | `baseUrl` | `String?` | `null` | Scheme + host for uploads, e.g. `https://api.example.com`. Core never opens a socket; `fieldtrack-sync` resolves a relative path against it |
 | `reset` | `Boolean` | `true` | `true` — this config is applied on top of factory defaults. `false` — the persisted config wins and this object is **ignored after the first launch**; only `setConfig()` changes anything after that. **Leave `true` during development** |
 
 Builder methods for the whole blocks: `.geolocation()`, `.motion()`, `.service()`,
-`.persistence()`, `.sensors()`, `.license()`, `.baseUrl()`, `.reset()`.
+`.persistence()`, `.sensors()`, `.security()`, `.license()`, `.baseUrl()`, `.reset()`.
 
 `config.validate(): List<String>` returns everything wrong with a config, or an empty list.
 `ready()` runs it and returns `ErrorCode.INVALID_CONFIG` with the joined messages.
@@ -493,8 +494,8 @@ Derived read-only properties: `accuracy.maxAccuracyM` and `accuracy.recoveryTrus
 coerced to ≤ `maxAccuracyM`).
 
 ```kotlin
-TrakerConfig.builder().accuracyProfile(AccuracyProfile.STRICT).build()
-TrakerConfig.builder().maxAccuracyMeters(35f).build()   // implies CUSTOM
+TrackerConfig.builder().accuracyProfile(AccuracyProfile.STRICT).build()
+TrackerConfig.builder().maxAccuracyMeters(35f).build()   // implies CUSTOM
 ```
 
 ### 5.7 `PersistenceConfig`
@@ -535,27 +536,27 @@ Builder: `.maxDaysToPersist()`, `.maxRecords()`, `.persistRawFixes()`, `.rawRing
 
 ---
 
-## 6. Public API — `Traker`
+## 6. Public API — `Tracker`
 
 ```kotlin
-val traker = Traker.getInstance(context)   // @JvmStatic, idempotent, thread-safe
+val traker = Tracker.getInstance(context)   // @JvmStatic, idempotent, thread-safe
 ```
 
 ### 6.1 Lifecycle
 
 | Method | Signature | Notes |
 |---|---|---|
-| `ready` | `suspend fun ready(config: TrakerConfig = TrakerConfig()): TrakerResult<TrakerState>` | Verifies the license, resolves and validates config, restores persisted filter state, starts provider/battery monitoring, enqueues the daily prune, and emits `SessionInterrupted` if a session was left open by a crash or force-stop |
-| `start` | `suspend fun start(tag: String? = null): TrakerResult<TrackSession>` | Opens a session. `NOT_READY` if `ready()` was not called |
-| `stop` | `suspend fun stop(): TrakerResult<TrackSession?>` | Closes the open session |
-| `state` | `val state: StateFlow<TrakerState>` | Coarse lifecycle state |
-| `events` | `val events: SharedFlow<TrakerEvent>` | Replay 0, unlimited subscribers |
+| `ready` | `suspend fun ready(config: TrackerConfig = TrackerConfig()): TrackerResult<TrackerState>` | Verifies the license, resolves and validates config, restores persisted filter state, starts provider/battery monitoring, enqueues the daily prune, and emits `SessionInterrupted` if a session was left open by a crash or force-stop |
+| `start` | `suspend fun start(tag: String? = null): TrackerResult<TrackSession>` | Opens a session. `NOT_READY` if `ready()` was not called |
+| `stop` | `suspend fun stop(): TrackerResult<TrackSession?>` | Closes the open session |
+| `state` | `val state: StateFlow<TrackerState>` | Coarse lifecycle state |
+| `events` | `val events: SharedFlow<TrackerEvent>` | Replay 0, unlimited subscribers |
 
 ### 6.2 Location
 
 | Method | Signature | Notes |
 |---|---|---|
-| `getCurrentLocation` | `suspend fun getCurrentLocation(): TrakerResult<TrackFix>` | One fresh fix. **Snapshot only** — not accepted, persisted, added to the odometer, or emitted as a tracking location. Errors: `NOT_READY`, `PERMISSION_DENIED`, `LOCATION_DISABLED`, `FIX_TIMEOUT` |
+| `getCurrentLocation` | `suspend fun getCurrentLocation(): TrackerResult<TrackFix>` | One fresh fix. **Snapshot only** — not accepted, persisted, added to the odometer, or emitted as a tracking location. Errors: `NOT_READY`, `PERMISSION_DENIED`, `LOCATION_DISABLED`, `FIX_TIMEOUT` |
 | `providerState` | `fun providerState(): StateFlow<ProviderState>` | GPS toggle, permission tier, granularity, fused availability, battery saver. Broadcast-driven, never polled |
 | `permissionTier` | `fun permissionTier(): PermissionTier` | |
 | `permissions` | `fun permissions(): PermissionManager` | The permission ladder as data |
@@ -595,12 +596,12 @@ All reads are paged — `PointQuery(limit = 500, offset = 0)` by default.
 
 | Method | Signature |
 |---|---|
-| `addGeofence` | `suspend fun addGeofence(geofence: TrakerGeofence): TrakerResult<TrakerGeofence>` |
-| `removeGeofence` | `suspend fun removeGeofence(id: String = TrakerGeofence.DEFAULT_ID): TrakerResult<Boolean>` |
-| `removeAllGeofences` | `suspend fun removeAllGeofences(): TrakerResult<Int>` |
-| `getGeofence` | `fun getGeofence(id: String = TrakerGeofence.DEFAULT_ID): TrakerGeofence?` |
-| `getGeofences` | `fun getGeofences(): List<TrakerGeofence>` |
-| `getGeofenceEvents` | `fun getGeofenceEvents(geofenceId: String? = null, fromMs: Long? = null, toMs: Long? = null, limit: Int = 500, offset: Int = 0): List<TrakerGeofenceEvent>` |
+| `addGeofence` | `suspend fun addGeofence(geofence: TrackerGeofence): TrackerResult<TrackerGeofence>` |
+| `removeGeofence` | `suspend fun removeGeofence(id: String = TrackerGeofence.DEFAULT_ID): TrackerResult<Boolean>` |
+| `removeAllGeofences` | `suspend fun removeAllGeofences(): TrackerResult<Int>` |
+| `getGeofence` | `fun getGeofence(id: String = TrackerGeofence.DEFAULT_ID): TrackerGeofence?` |
+| `getGeofences` | `fun getGeofences(): List<TrackerGeofence>` |
+| `getGeofenceEvents` | `fun getGeofenceEvents(geofenceId: String? = null, fromMs: Long? = null, toMs: Long? = null, limit: Int = 500, offset: Int = 0): List<TrackerGeofenceEvent>` |
 | `deleteGeofenceEvents` | `fun deleteGeofenceEvents(geofenceId: String? = null, fromMs: Long? = null, toMs: Long? = null): Int` |
 
 ### 6.7 Device state
@@ -626,28 +627,29 @@ All reads are paged — `PointQuery(limit = 500, offset = 0)` by default.
 The SDK has **no `var callback` properties** — a second registrant would silently replace the
 first. Everything is a Kotlin `Flow`.
 
-### 7.1 `TrakerEvent` — the event flow
+### 7.1 `TrackerEvent` — the event flow
 
 ```kotlin
 lifecycleScope.launch {
     traker.events.collect { event ->
         when (event) {
-            is TrakerEvent.Location           -> draw(event.point)
-            is TrakerEvent.LocationRejected   -> log(event.decision)
-            is TrakerEvent.MotionChange       -> updateUi(event.state, event.point)
-            is TrakerEvent.ActivityChange     -> show(event.activity, event.confidence)
-            is TrakerEvent.EnabledChange      -> toggle(event.enabled)
-            is TrakerEvent.ProviderChange     -> render(event.state)
-            is TrakerEvent.Heartbeat          -> touch(event.atMs)
-            is TrakerEvent.PowerSaveChange    -> warn(event.enabled)
-            is TrakerEvent.BatteryChange      -> battery(event.battery)
-            is TrakerEvent.GeofenceAdded      -> Unit
-            is TrakerEvent.GeofenceRemoved    -> Unit
-            is TrakerEvent.GeofenceEntered    -> arrive(event.geofence)
-            is TrakerEvent.GeofenceExited     -> depart(event.geofence)
-            is TrakerEvent.SessionInterrupted -> offerResume(event.session)
-            is TrakerEvent.Diagnostic         -> log(event.message)
-            is TrakerEvent.Error              -> handle(event.code, event.message)
+            is TrackerEvent.Location           -> draw(event.point)
+            is TrackerEvent.LocationRejected   -> log(event.decision)
+            is TrackerEvent.MotionChange       -> updateUi(event.state, event.point)
+            is TrackerEvent.ActivityChange     -> show(event.activity, event.confidence)
+            is TrackerEvent.EnabledChange      -> toggle(event.enabled)
+            is TrackerEvent.ProviderChange     -> render(event.state)
+            is TrackerEvent.Heartbeat          -> touch(event.atMs)
+            is TrackerEvent.PowerSaveChange    -> warn(event.enabled)
+            is TrackerEvent.BatteryChange      -> battery(event.battery)
+            is TrackerEvent.GeofenceAdded      -> Unit
+            is TrackerEvent.GeofenceRemoved    -> Unit
+            is TrackerEvent.GeofenceEntered    -> arrive(event.geofence)
+            is TrackerEvent.GeofenceExited     -> depart(event.geofence)
+            is TrackerEvent.IntegrityChange    -> integrity(event.report)
+            is TrackerEvent.SessionInterrupted -> offerResume(event.session)
+            is TrackerEvent.Diagnostic         -> log(event.message)
+            is TrackerEvent.Error              -> handle(event.code, event.message)
         }
     }
 }
@@ -665,7 +667,8 @@ lifecycleScope.launch {
 | `PowerSaveChange` | `enabled: Boolean` | Battery saver on/off |
 | `BatteryChange` | `battery: BatteryInfo` | Plug, unplug, low, okay — and drift the capture path notices |
 | `GeofenceAdded` / `GeofenceRemoved` | `geofence` / `geofenceId` | Registry changed |
-| `GeofenceEntered` / `GeofenceExited` | `geofence: TrakerGeofence` | A fence was crossed |
+| `GeofenceEntered` / `GeofenceExited` | `geofence: TrackerGeofence` | A fence was crossed |
+| `IntegrityChange` | `report: IntegrityReport` | The device-integrity flag set changed — transitions only, not every check ([§19](#19-device-integrity)) |
 | `SessionInterrupted` | `session: TrackSession` | `ready()` found a session left open by a crash or force-stop — you decide what to do |
 | `Diagnostic` | `message: String` | Informational |
 | `Error` | `code: ErrorCode`, `message: String` | Anything the SDK wants you to know about |
@@ -673,10 +676,10 @@ lifecycleScope.launch {
 Collect from a lifecycle scope for UI, or from an application-scoped one for work that must
 continue with no UI on screen.
 
-### 7.2 `TrakerState`
+### 7.2 `TrackerState`
 
 ```kotlin
-data class TrakerState(
+data class TrackerState(
     val isReady: Boolean = false,
     val isTracking: Boolean = false,
     val motionState: MotionState = MotionState.STOPPED,
@@ -698,12 +701,12 @@ data class ProviderState(
 )
 ```
 
-### 7.4 `TrakerResult` and `ErrorCode`
+### 7.4 `TrackerResult` and `ErrorCode`
 
 ```kotlin
-sealed interface TrakerResult<out T> {
-    data class Ok<T>(val value: T) : TrakerResult<T>
-    data class Error(val code: ErrorCode, val message: String) : TrakerResult<Nothing>
+sealed interface TrackerResult<out T> {
+    data class Ok<T>(val value: T) : TrackerResult<T>
+    data class Error(val code: ErrorCode, val message: String) : TrackerResult<Nothing>
 }
 ```
 
@@ -1010,7 +1013,7 @@ Up to **19** host fences. The SDK's internal stationary wake fence uses a reserv
 not count.
 
 ```kotlin
-val fence = TrakerGeofence(
+val fence = TrackerGeofence(
     id = "warehouse",
     latitude = 23.0225,
     longitude = 72.5714,
@@ -1020,8 +1023,8 @@ val fence = TrakerGeofence(
 )
 
 when (val result = traker.addGeofence(fence)) {
-    is TrakerResult.Ok    -> Unit
-    is TrakerResult.Error -> when (result.code) {
+    is TrackerResult.Ok    -> Unit
+    is TrackerResult.Error -> when (result.code) {
         ErrorCode.GEOFENCE_LIMIT_REACHED        -> pruneOldFences()
         ErrorCode.GEOFENCE_REGISTRATION_FAILED  -> retryLater()
         ErrorCode.INVALID_CONFIG                -> fixCoordinates()
@@ -1032,10 +1035,10 @@ when (val result = traker.addGeofence(fence)) {
 
 Validation: non-blank `id`, latitude in −90..90, longitude in −180..180, `radiusM > 0`.
 
-Crossings arrive as `TrakerEvent.GeofenceEntered` / `GeofenceExited` and are also persisted:
+Crossings arrive as `TrackerEvent.GeofenceEntered` / `GeofenceExited` and are also persisted:
 
 ```kotlin
-val history: List<TrakerGeofenceEvent> = traker.getGeofenceEvents(
+val history: List<TrackerGeofenceEvent> = traker.getGeofenceEvents(
     geofenceId = "warehouse",
     fromMs = startOfDay,
     limit = 100,
@@ -1044,15 +1047,15 @@ val deleted: Int = traker.deleteGeofenceEvents(geofenceId = "warehouse")
 ```
 
 ```kotlin
-data class TrakerGeofenceEvent(
-    val geofence: TrakerGeofence,
+data class TrackerGeofenceEvent(
+    val geofence: TrackerGeofence,
     val transition: GeofenceTransition,   // ENTER | EXIT
     val timestampMs: Long,
     val eventName: String,
 )
 ```
 
-Constants: `TrakerGeofence.MAX_GEOFENCES = 19`, `DEFAULT_ID = "trackit-stationary"`,
+Constants: `TrackerGeofence.MAX_GEOFENCES = 19`, `DEFAULT_ID = "trackit-stationary"`,
 `DEFAULT_ENTER_EVENT`, `DEFAULT_EXIT_EVENT`.
 
 ---
@@ -1078,7 +1081,7 @@ data class BatteryInfo(
 ```
 
 This is the same reading stamped on every stored point, so your display and your uploaded rows
-cannot disagree. `TrakerEvent.BatteryChange` carries the same transitions.
+cannot disagree. `TrackerEvent.BatteryChange` carries the same transitions.
 
 ```kotlin
 val sensors: DeviceSensors = traker.getSensors()
@@ -1199,7 +1202,7 @@ ArrowIcons.puck(sizePx = 56, color = Color.rgb(26, 115, 232))
 on it gets an offline-first SDK with no network code linked at all.
 
 ```kotlin
-val sync = TrakerSync.getInstance(context)   // @JvmStatic, idempotent, paired with Traker.getInstance
+val sync = TrackerSync.getInstance(context)   // @JvmStatic, idempotent, paired with Tracker.getInstance
 
 sync.configure(
     SyncConfig.builder()
@@ -1212,8 +1215,8 @@ sync.configure(
 )
 ```
 
-If you set `TrakerConfig.baseUrl`, you can supply only a path here — the base is resolved from
-config. An absolute `url` on `SyncConfig` always **wins** over `TrakerConfig.baseUrl`; the base
+If you set `TrackerConfig.baseUrl`, you can supply only a path here — the base is resolved from
+config. An absolute `url` on `SyncConfig` always **wins** over `TrackerConfig.baseUrl`; the base
 is a fallback, never an override.
 
 ### 14.1 `SyncConfig`
@@ -1245,11 +1248,11 @@ data class SyncTimeouts(
 )
 ```
 
-### 14.2 `TrakerSync` API
+### 14.2 `TrackerSync` API
 
 | Member | Signature | Notes |
 |---|---|---|
-| `getInstance` | `@JvmStatic fun getInstance(context: Context): TrakerSync` | Idempotent, thread-safe |
+| `getInstance` | `@JvmStatic fun getInstance(context: Context): TrackerSync` | Idempotent, thread-safe |
 | `configure` | `fun configure(config: SyncConfig, transport: SyncTransport? = null)` | Throws `IllegalArgumentException` on an invalid config. Omit `transport` to use the OkHttp default |
 | `endpoint` | `val endpoint: String?` | Where uploads go, or `null` if unconfigured — or if a 401 tore it down. Headers are deliberately not exposed |
 | `isConfigured` | `val isConfigured: Boolean` | Derived from `endpoint`. **Do not cache it** — a 401 clears configuration with no involvement from you |
@@ -1323,7 +1326,9 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
       "detected_activity_type": "IN_VEHICLE",
       "detected_activity_start_time": 1755499000000,
       "battery_percentage": "62",
-      "is_mock": false
+      "is_mock": false,
+      "integrity_flags": 0,
+      "integrity_signals": []
     }
   ]
 }
@@ -1331,6 +1336,8 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
 
 Your server should answer **2xx** for accepted, **401** for expired credentials, **403** for a
 rejected credential, and any other status to have the batch retried.
+
+`integrity_flags` and `integrity_signals` describe the device when the point was captured — see [§19.4](#194-on-the-wire-and-in-storage) for the frozen bit assignments. Both default, so an existing backend keeps parsing unchanged. Treat them as advisory input to a server-side rule rather than as the defence itself, and be suspicious of a client version that is known to send them and stops.
 
 ### 14.6 Custom transport
 
@@ -1546,14 +1553,14 @@ These exact strings appear on `TrackPoint.acceptReason`, `RawPoint.reason` and
 
 ## 17. Java interop
 
-Every entry point is Java-callable. `getInstance`, `TrakerConfig.builder()` and
+Every entry point is Java-callable. `getInstance`, `TrackerConfig.builder()` and
 `SyncConfig.builder()` are `@JvmStatic`; `PointQuery`, `TrackOptions` and the paged query
 methods carry `@JvmOverloads`.
 
 ```java
-Traker traker = Traker.getInstance(context);
+Tracker traker = Tracker.getInstance(context);
 
-TrakerConfig config = TrakerConfig.builder()
+TrackerConfig config = TrackerConfig.builder()
         .provider(LocationProviderType.GPS_ONLY)
         .accuracyProfile(AccuracyProfile.STRICT)
         .intervalMs(30_000L)
@@ -1564,7 +1571,7 @@ TrakerConfig config = TrakerConfig.builder()
 `suspend` functions need a coroutine. From Java, call them from Kotlin glue, or wrap them in
 your own `CoroutineScope` helper. Flows are consumed the same way.
 
-`TrakerConfig.Builder.build()` and `SyncConfig.Builder.build()` throw
+`TrackerConfig.Builder.build()` and `SyncConfig.Builder.build()` throw
 `IllegalArgumentException` on an invalid config — use `buildUnchecked()` plus `validate()` if
 you are assembling config from untrusted input.
 
@@ -1593,12 +1600,163 @@ inside your APK.
 
 ---
 
-## 19. Troubleshooting
+## 19. Device integrity
+
+A second security layer beside the license gate. It answers one question — *can this
+device fabricate the location data it is about to send?* — and lets you decide what to do
+about the answer.
+
+**Release only.** Every probe is skipped and every policy ignored when the host app is
+debuggable, exactly as the license check is waived there. Development builds, emulators
+and instrumentation runs are unaffected, with nothing to remember to switch off and
+nothing that could survive into production.
+
+### 19.1 What is checked
+
+| Signal | How | Default |
+|---|---|---|
+| `ACCESSIBILITY_SERVICE_ACTIVE` | A non-system accessibility service is enabled — the usual driver for UI automation | `WARN` |
+| `DEVELOPER_MODE_ENABLED` | `Settings.Global.DEVELOPMENT_SETTINGS_ENABLED` | `WARN` |
+| `ADB_ENABLED` | `Settings.Global.ADB_ENABLED` | `WARN` |
+| `HOOKING_FRAMEWORK_DETECTED` | Frida/Xposed: mapped libraries, agent thread names, default ports 27042/27043, `TracerPid`. Weighted; raised at confidence ≥ 60 | **`BLOCK`** |
+| `DEBUGGER_ATTACHED` | `TracerPid` non-zero or `Debug.isDebuggerConnected()` | **`BLOCK`** |
+| `AUTO_TIME_DISABLED` | Automatic date/time **and** automatic time zone both off | `WARN` |
+| `TIMEZONE_MISMATCH` | Device time zone not used in the serving cellular network's country | `WARN` |
+| `CLOCK_SKEWED` | System clock disagrees with **GNSS UTC** by more than `maxClockSkewMs` | `WARN` |
+| `MOCK_LOCATION_APP_SELECTED` | A visible installed package holds the mock-location app-op | **`BLOCK`** |
+| `MOCK_LOCATION_FIX` | The platform flagged a delivered fix as mock | **`BLOCK`** |
+
+No new permission is required, and `QUERY_ALL_PACKAGES` is deliberately **not** requested
+— see [§19.5](#195-limits-worth-knowing).
+
+### 19.2 Policy
+
+Three levels per group of signals:
+
+| Policy | Reported to the host | Stamped on points and uploaded | Blocks `ready()`/`start()` |
+|---|---|---|---|
+| `ALLOW` | no | no | no |
+| `WARN` | yes | yes | no |
+| `BLOCK` | yes | yes | yes |
+
+```kotlin
+val config = TrackerConfig.builder()
+    .securityEnabled(true)                                   // default
+    .hookingPolicy(IntegrityPolicy.BLOCK)                    // default
+    .mockLocationIntegrityPolicy(IntegrityPolicy.BLOCK)      // default
+    .accessibilityPolicy(IntegrityPolicy.WARN)               // default
+    .developerModePolicy(IntegrityPolicy.WARN)               // default
+    .clockPolicy(IntegrityPolicy.WARN)                       // default
+    .accessibilityAllowlist(setOf("com.yourco.kiosk"))
+    .maxClockSkewMs(120_000)                                 // default
+    .integrityRecheckIntervalMs(15 * 60_000)                 // default; 0 disables
+    .build()
+```
+
+`accessibility` defaults to `WARN` on purpose: accessibility services are also how blind
+and motor-impaired users operate a phone, and blocking on them would lock those users out
+of your app. Services installed as part of the system image never raise a finding.
+
+Setting `mockLocationIntegrityPolicy(BLOCK)` forces `mockLocationPolicy = REJECT`; the two
+cannot be left contradicting each other.
+
+### 19.3 Reading the result
+
+```kotlin
+when (val result = trackIt.ready(config)) {
+    is TrackerResult.Error ->
+        if (result.code == ErrorCode.DEVICE_INTEGRITY_BLOCKED) {
+            // result.message names the blocking signals
+            val report = trackIt.integrity()
+            showBlockedScreen(report.blockingSignals)
+        }
+    is TrackerResult.Ok -> Unit
+}
+
+// Live, and re-checked inside the health loop while a session is open.
+trackIt.integrityState()
+    .onEach { report -> banner.isVisible = report.findings.isNotEmpty() }
+    .launchIn(scope)
+
+// Force a fresh evaluation — reads /proc, the package list and a loopback socket.
+val fresh = trackIt.checkIntegrity()
+```
+
+`TrackerEvent.IntegrityChange` is emitted when the flag set changes, not on every
+evaluation. A `BLOCK` finding also arrives as `TrackerEvent.Error` with
+`ErrorCode.DEVICE_INTEGRITY_BLOCKED`, and mid-session it ends the session.
+
+`IntegrityReport.waived` is `true` in a debuggable build: nothing was probed, and the
+empty `findings` list is not a claim that the device is clean.
+
+### 19.4 On the wire and in storage
+
+Every accepted point carries `integrityFlags` — the bitmask of every signal observed when
+it was captured, `WARN` and `BLOCK` alike. It is stored on `track_point` (schema v7) and
+uploaded by `fieldtrack-sync`:
+
+```json
+{
+  "uuid": "…",
+  "is_mock": false,
+  "integrity_flags": 130,
+  "integrity_signals": ["DEVELOPER_MODE_ENABLED", "MOCK_LOCATION_APP_SELECTED"]
+}
+```
+
+The bit assignments are frozen: `ACCESSIBILITY_SERVICE_ACTIVE` = 1, `DEVELOPER_MODE_ENABLED`
+= 2, `ADB_ENABLED` = 4, `HOOKING_FRAMEWORK_DETECTED` = 8, `DEBUGGER_ATTACHED` = 16,
+`AUTO_TIME_DISABLED` = 32, `TIMEZONE_MISMATCH` = 64, `MOCK_LOCATION_APP_SELECTED` = 128,
+`MOCK_LOCATION_FIX` = 256, `CLOCK_SKEWED` = 512.
+
+Both fields default, so a backend that has never seen them keeps parsing. `0` means
+"nothing observed" — which is also what a debuggable build and a host with the layer
+disabled send, so tell "clean" from "not evaluated" by the client version, not by this
+column.
+
+**Evaluate server-side as well.** These flags are advisory input to a server rule, never
+the whole defence: an attacker who has already hooked the process can patch the client
+that produces them. The value is that tampering has to defeat both sides.
+
+### 19.5 Limits worth knowing
+
+- **Package visibility.** From Android 11 the SDK cannot enumerate every installed app, so
+  `MOCK_LOCATION_APP_SELECTED` catches a fake-GPS app only where the platform makes it
+  visible. `QUERY_ALL_PACKAGES` would fix that and is deliberately not requested — it is a
+  Play-policy declaration for every host, for a signal `MOCK_LOCATION_FIX` already covers
+  the moment a fake fix arrives. Add `<queries>` entries in your own manifest if you have a
+  specific list you care about.
+- **Client-side detection is not proof.** It raises cost; it does not make spoofing
+  impossible.
+- **The debuggable waiver is a real surface.** A repackaged APK can set the flag — but
+  re-signing changes the signing certificate, which is what the license token binds to.
+- **Emulators skip the Frida port scan.** CI images run enough loopback tooling to make it
+  noise.
+
+### 19.6 Build-time checks
+
+The SDK ships lint rules inside its AARs, so they run in **your** build:
+
+| Issue | Severity | Fires on |
+|---|---|---|
+| `FieldTrackSecurityDisabled` | fatal | `securityEnabled(false)` or `IntegrityPolicy.ALLOW` outside `src/debug/` |
+| `FieldTrackMockLocationAllowed` | fatal | `MockPolicy.ALLOW` |
+| `FieldTrackDebuggableRelease` | fatal | `android:debuggable="true"` in the manifest |
+| `FieldTrackLicenseHardcoded` | warning | A license token written as a string literal |
+
+Fatal issues fail `assembleRelease` through AGP's `lintVital` — which is the point: the
+runtime layer waives itself in debug builds, so only the build can catch a release that
+shipped with it switched off. Overrides belong in `src/debug/`, where the rules do not
+fire and the runtime waiver already applies.
+
+---
+
+## 20. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `ready()` returns `LICENSE_MISSING` | Release build with no token | Add the `TrackItLicense` manifest meta-data or `.license(...)` in config ([§2](#2-license-token)) |
-| `start()` returns `NOT_READY` | `ready()` not called or it failed | Check the `TrakerResult` from `ready()` |
+| `start()` returns `NOT_READY` | `ready()` not called or it failed | Check the `TrackerResult` from `ready()` |
 | `start()` returns `PERMISSION_DENIED` | No location permission | Walk the ladder in [§4](#4-permissions) |
 | `start()` returns `PLAY_SERVICES_UNAVAILABLE` | No Google Play Services | Set `providerType = GPS_ONLY` |
 | Empty track, no points at all | `NETWORK_ONLY` with a tight accuracy ceiling | `validate()` rejects this — use `AccuracyProfile.RELAXED` or `CUSTOM` ≥ 50 m |
@@ -1613,4 +1771,8 @@ inside your APK.
 | Tracking stopped and the queue emptied | A 401 tore everything down | Re-authenticate, then `ready()` / `start()` / `configure()` again |
 | `SNAP_UNAVAILABLE` in `warnings` | Your snap provider could not answer | Never fatal — the raw track is drawn. Check the OSRM server |
 | `MOTION_DETECTION_DEGRADED` | `motionQuality = POOR` on this hardware | Capture is forced to `CONTINUOUS`; expect more battery use |
+| `ready()`/`start()` returns `DEVICE_INTEGRITY_BLOCKED` | A `BLOCK`-policy signal fired | Read `trackIt.integrity()` for the signals ([§19](#19-device-integrity)); relax that policy to `WARN` if the device is legitimate |
+| Session ends by itself with `DEVICE_INTEGRITY_BLOCKED` | The health-loop re-check fired mid-session | Same as above; `integrityRecheckIntervalMs(0)` disables the periodic re-check |
+| Integrity findings never appear | The host app is debuggable, so the layer is waived | Expected. Check `IntegrityReport.waived`; exercise the layer in a release build |
+| `assembleRelease` fails on `FieldTrackSecurityDisabled` | A release source set disables the integrity layer | Move the override to `src/debug/` ([§19.6](#196-build-time-checks)) |
 | Live map jumps backwards | Drawing a stale frame | Drop any `LiveTrackUpdate` whose `sequence` is not newer than the last drawn |
