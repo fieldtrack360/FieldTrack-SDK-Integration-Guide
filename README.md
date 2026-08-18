@@ -10,7 +10,6 @@ every public method, every event and callback.
 |---|---|
 | Maven group | `com.github.fieldtrack360.fieldtrack` |
 | Distribution | JitPack (`https://jitpack.io`) |
-| Package namespace | `com.devstree.traker` |
 | `minSdk` | 26 (Android 8.0) |
 | `compileSdk` / `targetSdk` | 37 |
 | JDK / Java target | 17 |
