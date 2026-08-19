@@ -168,7 +168,7 @@ Supply it either in your manifest:
 ```xml
 <application>
     <meta-data
-        android:name="TrackItLicense"
+        android:name="TrackerLicense"
         android:value="YOUR_LICENSE_TOKEN" />
 </application>
 ```
@@ -1595,7 +1595,7 @@ What this means in practice:
 
 If you hit a `NoSuchMethodError` or a serialization failure after enabling minification in your
 own app, that is a bug worth reporting — do **not** paper over it with
-`-keep class com.devstree.traker.** { *; }`, which would disable shrinking for the whole SDK
+`-keep class com.field360.tracker.** { *; }`, which would disable shrinking for the whole SDK
 inside your APK.
 
 ---
@@ -1755,7 +1755,7 @@ fire and the runtime waiver already applies.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `ready()` returns `LICENSE_MISSING` | Release build with no token | Add the `TrackItLicense` manifest meta-data or `.license(...)` in config ([§2](#2-license-token)) |
+| `ready()` returns `LICENSE_MISSING` | Release build with no token | Add the `TrackerLicense` manifest meta-data or `.license(...)` in config ([§2](#2-license-token)) |
 | `start()` returns `NOT_READY` | `ready()` not called or it failed | Check the `TrackerResult` from `ready()` |
 | `start()` returns `PERMISSION_DENIED` | No location permission | Walk the ladder in [§4](#4-permissions) |
 | `start()` returns `PLAY_SERVICES_UNAVAILABLE` | No Google Play Services | Set `providerType = GPS_ONLY` |
