@@ -43,7 +43,7 @@ map rendering, and an upload (sync) engine.
 
 | | |
 |---|---|
-| Package | `@fieldtrack360/react-native-tracker` |
+| Package | [`@fieldtrack360/react-native-tracker`](https://www.npmjs.com/package/@fieldtrack360/react-native-tracker) |
 | Platforms | iOS 17+, Android API 26+ |
 | Architecture | New Architecture only (TurboModule + Fabric codegen) |
 
