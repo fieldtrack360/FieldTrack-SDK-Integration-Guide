@@ -1,4 +1,4 @@
-# @fieldtrack360/react-native-tracker
+# FieldTrack Tracker React-Native — Integration Guide
 
 **FieldTrack360 Tracker for React Native** — a background location-tracking plugin with two native
 map components, built for React Native (CLI). New Architecture only — TurboModule + Fabric.
