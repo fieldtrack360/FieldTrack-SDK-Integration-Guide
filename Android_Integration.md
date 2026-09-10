@@ -1631,6 +1631,7 @@ is a fallback, never an override.
 | `allowCleartext` | `Boolean` | `false` | Permit an `http://` URL. Local development only. Loopback hosts (`localhost`, `127.0.0.1`, `::1`, `10.0.2.2`) are already exempt |
 | `timeouts` | `SyncTimeouts` | 5 s / 30 s / 20 s | Applied by the built-in transport; ignored by a custom one |
 | `includePointSessionId` | `Boolean` | `false` | Stamp every uploaded point with the session that recorded it (`session_id` on each row of `location`). The envelope's `session_id` describes a whole batch, and a backlog drained after a process kill can hold rows from two drives — this is the only field that says which is which. Off by default, so the body stays byte-identical to every previous release. **Set it on any host that records offline** |
+| `syncLogs` | `Boolean` | `true` | Ship diagnostics too, to this URL's origin plus `v1/logs/batch`, inheriting `device_id` from `extraParams` and reusing these headers — see [§15.1](#151-turning-it-on). **Set it to `false` until your backend implements that endpoint**, or every device posts a batch every fifteen minutes for a `404`. Overridden, not replaced, by an explicit `configureLogs()` |
 | `extraParams` | `Map<String, Any>` | empty | Merged into the **top level** of every request body, alongside the `location` array — see [§14.1.1](#1411-extraparams--your-own-body-fields) |
 
 > **`method` accepts `POST`, `PUT` or `PATCH`, and nothing else.** The built-in transport
@@ -1658,7 +1659,7 @@ is a fallback, never an override.
 **Builder**: `.url()`, `.baseUrl()`, `.path()`, `.method()`, `.header(name, value)`,
 `.headers(map)`, `.autoSync()`, `.batchSize()`, `.requiresUnmeteredNetwork()`,
 `.gzipRequestBody()`, `.allowCleartext()`, `.timeouts(SyncTimeouts)`,
-`.timeouts(connectMs, readMs, writeMs)`, `.includePointSessionId()`,
+`.timeouts(connectMs, readMs, writeMs)`, `.includePointSessionId()`, `.syncLogs()`,
 `.extraParam(name, value)`, `.extraParams(map)`,
 `.build()`, `.buildUnchecked()`.
 
@@ -2100,9 +2101,9 @@ which writes another one.
 
 ## 15. Log module — diagnostics to your backend
 
-**Optional, off by default, and in the same artifact as [§14](#14-sync-module--upload-to-your-backend).**
-Nothing below happens until you call `configureLogs()`, and an app that never calls it pays
-no network, no database file and no battery.
+**On by default with the sync module, and in the same artifact as [§14](#14-sync-module--upload-to-your-backend).**
+`SyncConfig.syncLogs` defaults to `true`, so `configure()` turns this channel on for you.
+Set it to `false` and nothing below happens: no network, no database file, no battery.
 
 Points answer *where the device was*. They cannot answer *why there is nothing there*. A
 track with a twenty-minute hole in it is unreadable on its own — and every plausible cause
@@ -2122,7 +2123,7 @@ need explained — a process an OEM killed mid-drive — is exactly the case whe
 
 ### 15.1 Turning it on
 
-Two lines. `configureLogs()` **follows the points endpoint** you already configured:
+One line, and it is the one you already wrote. The channel **follows the points endpoint**:
 
 ```kotlin
 val sync = TrackerSync.getInstance(context)
@@ -2135,19 +2136,39 @@ sync.configure(
         .extraParam("device_id", installId)
         .build()
 )
-
-sync.configureLogs()          // -> <same origin>/v1/logs/batch
+// diagnostics now ship to <same origin>/v1/logs/batch
 ```
 
-Called with no argument it derives the URL from the origin of the `SyncConfig` in force plus
-`v1/logs/batch`, inherits `device_id` from `SyncConfig.extraParams`, and reuses the points
-headers.
+`configure()` derives the log URL from the origin of that `SyncConfig` plus `v1/logs/batch`,
+inherits `device_id` from its `extraParams`, and reuses its headers.
+
+> **Turn it off until your backend has the endpoint.** With `syncLogs` on and no
+> `v1/logs/batch` on the other side, the device posts a batch every fifteen minutes and the
+> server answers `404`. Nothing accumulates — a permanently-rejected batch is dropped rather
+> than retried ([§15.8](#158-results-and-failure-semantics)) — but it is traffic nobody is
+> reading:
+>
+> ```kotlin
+> SyncConfig.builder().url(...).syncLogs(false).build()
+> ```
+
+> **A points config that cannot complete a log config is not an error.** The log envelope
+> requires `device_id` and the points envelope does not, so a host that never set one gets
+> one warning under `Tracker/TrackerSync` naming the fix, and points upload continues
+> untouched. `configure()` does not throw for this — only an explicit `configureLogs()` does.
+>
+> ```
+> adb logcat -s Tracker/TrackerSync
+> ```
 
 > **`device_id` must be the same string on both channels.** That join — a hole in a track,
 > next to the reason for it — is the whole point. Two spellings of the same phone produce
 > two unrelated datasets. Inheriting it is the default for that reason.
 
-Override any of it with a `LogSyncConfig`:
+### 15.1.1 Overriding what it derived
+
+`configureLogs()` is the override, not the switch. Call it after `configure()` to change the
+endpoint, give the channel its own credential, or set a level or a buffer size:
 
 ```kotlin
 sync.configureLogs(
@@ -2165,12 +2186,23 @@ design — it stops tracking and clears the queue ([§14.4](#144-terminal-failur
 A 401 here only stops log shipping. Keeping the scopes apart is what stops a diagnostics
 mistake reaching the point queue.
 
-`configureLogs()` is idempotent and safe to call on every launch — call it right after
-`configure()`, in `Application.onCreate`. It throws `IllegalArgumentException` if the
-resolved config does not validate, so wrap it the same way you wrap `configure()`.
+**An endpoint you name here is yours from then on.** It is never re-derived by a later
+`configure()` and never torn down by `syncLogs = false`. An endpoint the SDK derived does
+move: re-`configure()` against a new host and diagnostics follow it, which is what stops a
+staging build shipping its logs to production.
 
-**The two channels are independent in both directions.** Either can be set without the
-other, neither can tear the other down, and no log failure can reach `Tracker.stop()`, the
+`configureLogs()` is idempotent and safe to call on every launch — call it right after
+`configure()`, in `Application.onCreate`. Unlike `configure()`'s automatic path it **does**
+throw `IllegalArgumentException` if the resolved config does not validate, so wrap it the
+same way you wrap `configure()`.
+
+`disableLogSync()` stops either kind. A later `configure()` carrying `syncLogs = true` turns
+it back on, because that config is the standing instruction and the call is a one-off — to
+keep it off, configure with `syncLogs = false`.
+
+**The two channels stay independent once configured.** `configure()` seeds the log channel
+and that is the only thread between them: after that neither can tear the other down, a log
+credential cannot reach the point queue, and no log failure can reach `Tracker.stop()`, the
 upload queue, or a stored position.
 
 ### 15.2 How the channel works
@@ -2309,11 +2341,11 @@ busy device that is a radio wake every cooldown window.
 
 | Member | Signature | Notes |
 |---|---|---|
-| `configureLogs` | `fun configureLogs(config: LogSyncConfig = LogSyncConfig(), transport: SyncTransport? = null)` | Turns the channel on. Idempotent. Throws `IllegalArgumentException` on a config that cannot be resolved |
+| `configureLogs` | `fun configureLogs(config: LogSyncConfig = LogSyncConfig(), transport: SyncTransport? = null)` | **Overrides** what `SyncConfig.syncLogs` derived — it is not the switch. Idempotent. An endpoint named here is never re-derived by a later `configure()`. Throws `IllegalArgumentException` on a config that cannot be resolved |
 | `disableLogSync` | `fun disableLogSync()` | Stops recording and shipping. **The buffer is kept** — entries written before you turned it off still describe the period they were written in, and still ship if the channel comes back |
 | `logEndpoint` | `val logEndpoint: String?` | Where diagnostics go, or `null` if unconfigured — or if the endpoint refused the channel. Headers are deliberately not exposed |
 | `isLogSyncConfigured` | `val isLogSyncConfigured: Boolean` | Derived from `logEndpoint`. **Do not cache it** — a refusal clears configuration with no involvement from you |
-| `log` | `fun log(level: LogLevel, tag: String, message: String, code: String? = null, data: String? = null)` | Records one host line as a `MESSAGE`. Fire and forget; a no-op until `configureLogs()` and unless the level and type pass its filters |
+| `log` | `fun log(level: LogLevel, tag: String, message: String, code: String? = null, data: String? = null)` | Records one host line as a `MESSAGE`. Fire and forget; a no-op while the channel is off and unless the level and type pass its filters |
 | `logLifecycle` | `fun logLifecycle(phase: String, tag: String = "Host")` | Records a boundary of your own — a shift starting, a job accepted. `phase` is a `LifecyclePhase` constant or your own string |
 | `getLogs` | `suspend fun getLogs(sessionId: String? = null, limit: Int = 200, offset: Int = 0): List<LogRecord>` | The device buffer, newest first. `null` means every session, including entries belonging to none |
 | `pendingLogCount` | `suspend fun pendingLogCount(): Int` | Entries waiting to ship |
@@ -2382,8 +2414,9 @@ and therefore on none of it.
 `step_detector` and `step_counter` — a `false` on either is *no sensor* or *no permission*,
 and a different phone and a prompt are not the same remedy.
 
-Written once per session: on the session-start signal, and again if you call
-`configureLogs()` part-way through a session that is already open. Never without an open
+Written once per session: on the session-start signal, and again if the channel is turned on
+or reconfigured — by `configure()` or `configureLogs()` — part-way through a session that is
+already open. Never without an open
 session to file it against — an entry describing a session belongs to one.
 
 ### 15.6 Writing your own lines
@@ -2489,7 +2522,7 @@ sealed interface LogSyncQueue.Result {
 loss and a retry loop is the lesser evil; for a log, a poison batch that blocks the buffer
 forever costs battery and buys nothing.
 
-Recovery from any halt is the next `configureLogs()` — which, if you call it in
+Recovery from any halt is the next `configure()` or `configureLogs()` — which, if you call either in
 `Application.onCreate` as recommended, means the next process start picks up an endpoint you
 deployed in the meantime, with the buffer intact.
 
@@ -2725,7 +2758,7 @@ response was lost is re-sent whole, and every entry in it collides on its derive
 | Response | The SDK's behaviour | `LogSyncQueue.Result` |
 |---|---|---|
 | `200` / `201` / `204` | Rows settled, drain continues with the next batch | `Shipped(n)` |
-| `401`, `403` | **Channel halts** — shipping and recording both stop. The buffer is kept, and tracking, the point queue and stored positions are untouched. Recovery is the next `configureLogs()` | `Rejected(401 or 403)` |
+| `401`, `403` | **Channel halts** — shipping and recording both stop. The buffer is kept, and tracking, the point queue and stored positions are untouched. Recovery is the next `configure()` or `configureLogs()` | `Rejected(401 or 403)` |
 | `404`, `405`, `501` | **Channel halts** the same way — there is no endpoint at this URL, and every later batch would collect the same answer. One request per process, then silence | `Rejected(code)` |
 | `413` | Batch **dropped**, not retried: it is over the server's entry ceiling and will never be accepted | drain continues |
 | Other `4xx` | Batch dropped, drain continues with the next batch | drain continues |
@@ -2819,7 +2852,8 @@ response it may never have received.
 
 #### On the device
 
-A second Room database, created only when `configureLogs()` is called, named for your package
+A second Room database, created on the first entry written once the channel is on, named for
+your package
 so two apps embedding the SDK cannot collide, and kept **separate from the file holding
 positions** — which is what makes a credential failure on the log endpoint structurally unable
 to reach a stored point.
@@ -3019,7 +3053,9 @@ kilobytes per device per shift.
 turn it off again — a `DEBUG` flag set during a ticket and never cleared is how one device
 ends up shipping 29 000 rows a day for a year.
 
-If you never want the channel at all, do nothing: it is off until `configureLogs()`.
+If you never want the channel at all, build the points config with `.syncLogs(false)` — see
+[§15.1](#151-turning-it-on). Nothing is recorded, nothing is uploaded, and the database file
+is never created.
 
 ---
 
@@ -3445,9 +3481,9 @@ fire and the runtime waiver already applies.
 | Background uploads stopped after adding a custom `SyncTransport` | A worker process runs `Application.onCreate` and nothing else, so your transport is only installed if you install it there | Configure sync, and supply your transport, from `Application.onCreate` so every process has both ([§14.6](#146-custom-transport)) |
 | `NetworkAvailable` arrives but nothing uploads | The drain ran and failed — the event says a drain was *requested*, not that it succeeded | Read the `HttpResponse` that follows for the reason; a `null` `statusCode` means the request never completed |
 | Backlog uploads in a scrambled order | Fixed — the queue is FIFO by insertion, including across a reboot | Update the SDK; older builds ordered on a monotonic clock that restarts at boot |
-| Nothing ever reaches the log endpoint | `configureLogs()` was never called — points and diagnostics are separate channels | Call it after `configure()` ([§15.1](#151-turning-it-on)) |
+| Nothing ever reaches the log endpoint | `SyncConfig.syncLogs` is `false`, or it is on but the config could not be derived — check logcat for the warning naming what is missing, usually `device_id` in `extraParams` | Set `syncLogs(true)` and supply `device_id`, or call `configureLogs(...)` explicitly ([§15.1](#151-turning-it-on)) |
 | Log entries arrive up to 15 minutes late | Working as designed: the channel is a quarter-hourly heartbeat, and only `nudgeLevel` and above drain promptly | Nothing, or lower `nudgeLevel` to `INFO` — a battery cost, not a free one ([§15.3](#153-logsyncconfig)) |
-| Log shipping stopped on its own, entries still buffered | The endpoint refused the channel: 401/403 on the credential, or 404/405/501 meaning there is no endpoint there | Fix the route or the token; the next `configureLogs()` retries with the buffer intact ([§15.8](#158-results-and-failure-semantics)) |
+| Log shipping stopped on its own, entries still buffered | The endpoint refused the channel: 401/403 on the credential, or 404/405/501 meaning there is no endpoint there | Fix the route or the token; the next `configure()` or `configureLogs()` retries with the buffer intact ([§15.8](#158-results-and-failure-semantics)) |
 | Logs saved under a device your points are not under | `LogSyncConfig.deviceId` differs from `SyncConfig.extraParams["device_id"]` | Leave `deviceId` blank so it inherits. The join between the two channels is that string ([§15.1](#151-turning-it-on)) |
 | `seq` has gaps | The device buffer is bounded and evicted its oldest entries | Expected, and reported rather than hidden. Raise `bufferCapacity` or shorten `uploadIntervalMinutes` ([§15.7](#157-logrecord-and-its-enums)) |
 | A `data` payload is missing from an entry that is otherwise there | It was not a JSON object or array, so it was dropped rather than sent | Pass valid JSON text to `log()`; the entry itself is always kept ([§15.6](#156-writing-your-own-lines)) |
