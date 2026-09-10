@@ -2163,7 +2163,7 @@ Turn it off with one builder call, and nothing is derived at all:
 ```kotlin
 SyncConfig.builder()
     .url("https://api.example.com/v1/location/batch")
-    .syncLogs(false)
+    .syncLogs(true)
     .build()
 ```
 
