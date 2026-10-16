@@ -567,6 +567,8 @@ Builder methods for the whole blocks: `.geolocation()`, `.motion()`, `.service()
 | `navigationMode` | `Boolean` | `false` | ~1 Hz high-accuracy profile that overrides every adaptive tier. **Requires `service.foregroundService`** |
 | `navigationIntervalMs` | `Long` | `1_000` | Navigation interval |
 | `navigationFastestIntervalMs` | `Long` | `500` | Navigation floor |
+| `stationaryIntervalMs` | `Long` | `300_000` | **Parked tier**, `ADAPTIVE` only: the stream's interval once the device is parked (at `STATIONARY`, or after `stopTimeoutMin` with no movement since the session opened). OS batching is off on this tier. Capped at half of `deadTrackerStationaryMin`. A value ≤ `intervalMs` — `0` included — keeps the base interval while parked (the old behaviour) |
+| `stationaryAccuracy` | `DesiredAccuracy?` | `null` | Priority of the parked-tier request. `null` keeps `desiredAccuracy`. `BALANCED` saves more but feeds the stationary filter Wi-Fi/cell centroids that hop indoors |
 
 **`TrackingMode`**
 
@@ -574,14 +576,17 @@ Builder methods for the whole blocks: `.geolocation()`, `.motion()`, `.service()
 |---|---|
 | `CONTINUOUS` | Stream at `intervalMs` always; the filter does all thinning. Highest fidelity, highest battery |
 | `ADAPTIVE` | Stream while moving with adaptive cadence; heartbeat-only while stationary (default) |
+| `ADAPTIVE` | Stream while moving with adaptive cadence; slowed to `stationaryIntervalMs` while parked, with the filter keeping only the heartbeat (default) |
 | `MOTION_ONLY` | Location fully off while stationary. Lowest battery, coarsest stop timing |
 
 **When each tier is in force** (fastest wins: navigation → turn burst → vehicular → base):
+**When each tier is in force** (fastest wins: navigation → turn burst → vehicular → base → parked):
 
 | Tier | Raised by | Dropped by |
 |---|---|---|
 | vehicular | A fix reporting **≥ 2.5 m/s** — the same threshold the turn burst and the gyroscope use. Not the `MOVING` motion state: walking is moving and is not vehicular | `STOP_PENDING` — the moment fixes stop reporting movement, not `stopTimeoutMin` later |
 | turn burst | `TurnDetector` (GNSS heading) or `GyroTurnMonitor` (yaw rate), whichever sees the corner first | Both releasing it, or a stop |
+| parked (`ADAPTIVE` only) | `STATIONARY`; or `stopTimeoutMin` with no movement since the session opened (a session started, or revived after an OEM kill, at a desk never reaches `STATIONARY`) | `MOVING` — significant motion, activity recognition, the stationary geofence, or a parked fix that reads as moving. Any faster tier also outranks it while in force |
 
 A tier dropped at `STOP_PENDING` is *parked*, not forgotten: pulling away restores it on the
 `MOVING` transition rather than waiting for another fix to measure speed. A committed stop
@@ -592,6 +597,14 @@ the location stream stays registered while the device is parked. `ADAPTIVE` keep
 and lets the filter thin, because the heartbeat is what recovers a device whose wake paths
 all failed; `MOTION_ONLY` genuinely unregisters it. A phone parked for eight hours costs
 near zero on the third and a full day of radio duty on the first two.
+The battery difference between the three modes is mostly whether the location stream keeps
+sampling while the device is parked. `CONTINUOUS` keeps it at `intervalMs`. `ADAPTIVE` keeps
+it registered but slowed to `stationaryIntervalMs` (five minutes by default), because the
+heartbeat is what recovers a device whose wake paths all failed — the cost is that such a
+device is noticed up to one parked interval late. `MOTION_ONLY` genuinely unregisters it. A
+phone parked for eight hours costs a full day of receiver duty on the first, a fraction of
+that on the second, and near zero on the third. Before the parked tier existed, `ADAPTIVE`
+cost the same as `CONTINUOUS` while parked.
 
 **The mode you set is not always the mode that runs.** On a device where motion detection
 cannot be trusted, `ready()` rewrites this to `CONTINUOUS` — which is the most expensive
@@ -614,6 +627,8 @@ Builder: `.trackingMode()`, `.provider()`, `.desiredAccuracy()`, `.accuracy()`,
 `.vehicularIntervalMs()`, `.turnBurst()`, `.turnBurstIntervalMs()`, `.navigationMode()`,
 `.navigationIntervalMs()`, `.navigationFastestIntervalMs()`, `.oneShotTimeoutMs()`,
 `.mockLocationPolicy()`.
+`.navigationIntervalMs()`, `.navigationFastestIntervalMs()`, `.stationaryIntervalMs()`,
+`.stationaryAccuracy()`, `.oneShotTimeoutMs()`, `.mockLocationPolicy()`.
 
 ### 5.3 `MotionConfig`
 
@@ -670,20 +685,30 @@ Builder: `.useSignificantMotion()`, `.useStepCorroboration()`, `.useGyroTurnPred
 | `deadTrackerMovingMin` | `Int` | `30` | Minutes with no fix while moving before declaring the tracker dead |
 | `deadTrackerStationaryMin` | `Int` | `60` | Same, while stationary |
 | `wakeLockMs` | `Long` | `20_000` | Wake-lock hold during a capture burst |
+| `wakeLockMs` | `Long` | `20_000` | Wake-lock hold per delivered fix (`WakeLockPolicy.PER_FIX`), **capped at a third of the fix's cadence tier** (never below 2 s) — 4 s at the 12 s vehicular tier, 5 s at a 15 s base. Without the cap any tier faster than the hold kept the CPU awake continuously. One-shot and backstop fixes keep the full value |
 | `notificationTitle` | `String` | `"Tracking active"` | Foreground notification title. **Never overridden** — the sync diagnostic below cannot take this slot |
 | `notificationText` | `String` | `"Recording your location"` | Foreground notification body |
 | `notificationChannelId` | `String` | `"trackit_tracking"` | Channel id |
 | `notificationChannelName` | `String` | `"Location tracking"` | Channel name shown in system settings |
 | `notificationSmallIconResName` | `String?` | `null` | Drawable **resource name** (e.g. `"ic_tracking"`) for the small icon |
+| `showRecoveryNotification` | `Boolean` | `true` | On `FGS_START_REFUSED` with a session open, post a "tap to resume" notification. The tap restarts the service in the same session (legal on API 31+, unlike background retries). A swipe silences it until the session ends |
+| `recoveryNotificationTitle` | `String` | `"Tracking paused"` | Tap-to-resume title |
+| `recoveryNotificationText` | `String` | `"Tap to resume location tracking"` | Tap-to-resume body |
+| `recoveryNotificationChannelId` | `String` | `"trackit_recovery"` | Channel id (`IMPORTANCE_DEFAULT`, separate from the quiet ongoing channel) |
+| `recoveryNotificationChannelName` | `String` | `"Tracking alerts"` | Channel name shown in system settings |
 | `showSyncStatusInNotification` | `Boolean` | `false` | **Diagnostic — leave off in a shipping app.** Layers a live upload-queue line onto the subtitle and body while tracking; the title is untouched. See below |
 | `syncNotificationSubText` | `String?` | `null` | The **subtitle** shown beside `notificationTitle` while the sync line is on screen. `null` = no subtitle. Rendered with `setSubText`; never replaces the title |
 | `syncNotificationText` | `String` | `"unsynced {pending} · last upload {age}"` | The sync line template. See the token table below. Ignored unless `showSyncStatusInNotification` is on |
+| `powerReportIntervalMin` | `Int` | `15` | Emit a `PowerReported` event this often during a session: battery drain (charge counter and %), screen-on time, and the SDK's own fixes, wake-lock time, one-shots, remote wakes and cadence tier for the same window. Recorded by `fieldtrack-sync`'s log channel as tag `Power`, code `POWER_REPORT`. `0` disables |
 
 Builder: `.foregroundService()`, `.stopOnTerminate()`, `.startOnBoot()`, `.healthLoopMs()`,
 `.watchdogIntervalMs()`, `.watchdogThrottleMs()`, `.backstopIntervalMin()`,
 `.deadTrackerMovingMin()`, `.deadTrackerStationaryMin()`, `.wakeLockMs()`,
 `.notification(title, text)`, `.notificationChannel(id, name)`, `.notificationSmallIconResName()`,
 `.showSyncStatusInNotification()`, `.syncNotification(subText, text)`.
+`.showRecoveryNotification()`, `.recoveryNotification(title, text)`,
+`.recoveryNotificationChannel(id, name)`, `.showSyncStatusInNotification()`, `.syncNotification(subText, text)`,
+`.powerReportIntervalMin()`.
 
 #### The upload-status notification
 
@@ -796,6 +821,8 @@ Builder: `.maxDaysToPersist()`, `.maxRecords()`, `.persistRawFixes()`, `.rawRing
 - `navigationIntervalMs <= 0`, `navigationIntervalMs < navigationFastestIntervalMs`, or
   `navigationMode` without `foregroundService`
 - `maxDaysToPersist < 0`
+- `stationaryIntervalMs < 0` or `powerReportIntervalMin < 0` (a parked interval at or below
+  `intervalMs` is legal and simply leaves the tier off)
 - `maxAccuracyMeters` set without `CUSTOM`, missing with `CUSTOM`, or outside 5–500 m
 - `recoveryTrustMeters <= 0`
 - `NETWORK_ONLY` with an accuracy ceiling below 50 m
@@ -823,6 +850,7 @@ val tracker = Tracker.getInstance(context)   // @JvmStatic, idempotent, thread-s
 | `state` | `val state: StateFlow<TrackerState>` | Coarse lifecycle state |
 | `events` | `val events: SharedFlow<TrackerEvent>` | Replay 0, unlimited subscribers |
 | `wake` | `@JvmStatic @WorkerThread fun Tracker.wake(context: Context): WakeResult` | **Static, on the companion.** Remote wake for a high-priority FCM message — forces a fix and an upload if the service is alive, restarts it if a session is open and the service is dead, does nothing otherwise. Safe in a cold process and before `ready()`. See [§12.4](#124-remote-wake--fcm) |
+| `wake` | `@JvmStatic @WorkerThread fun Tracker.wake(context: Context): WakeResult` | **Static, on the companion.** Remote wake for a high-priority FCM message — requests an upload, plus a forced fix unless the stream is already delivering, if the service is alive; restarts it if a session is open and the service is dead, does nothing otherwise. Safe in a cold process and before `ready()`. See [§12.4](#124-remote-wake--fcm) |
 
 ### 6.2 Location
 
@@ -942,6 +970,7 @@ lifecycleScope.launch {
 | `Heartbeat` | `atMs: Long` | **Control-plane** liveness tick (distinct from the data-plane heartbeat) |
 | `PowerSaveChange` | `enabled: Boolean` | Battery saver on/off |
 | `BatteryChange` | `battery: BatteryInfo` | Plug, unplug, low, okay — and drift the capture path notices |
+| `PowerReported` | `report: PowerReport` | Every `powerReportIntervalMin` during a session: where the battery went. Device side — `batteryPercent`, `batteryPercentDrop`, `drainMa` (charge counter), `drainPercentPerHour`, `pluggedDuringWindow`, `screenOnMs`, `powerSaveMode`. SDK side — `fixesDelivered`, `wakeLockHeldMs`, `oneShotFixes`, `remoteWakes`, `remoteWakeOneShotsSkipped`, `cadenceMs`, `parkedTier`, `motionState`. Drain figures are `null` when unmeasurable (plugged in, unsupported counter, window under 5 min) |
 | `GeofenceAdded` / `GeofenceRemoved` | `geofence` / `geofenceId` | Registry changed |
 | `GeofenceEntered` / `GeofenceExited` | `geofence: TrackerGeofence` | A fence was crossed |
 | `IntegrityChange` | `report: IntegrityReport` | The device-integrity flag set changed — transitions only, not every check ([§20](#20-device-integrity)) |
@@ -1001,6 +1030,7 @@ data class ProviderState(
     val fusedAvailable: Boolean = false,
     val powerSaveMode: Boolean = false,
     val airplaneMode: Boolean = false,
+    val locationPowerSaveMode: LocationPowerSaveMode = LocationPowerSaveMode.NO_CHANGE,
 )
 ```
 
@@ -1013,6 +1043,16 @@ devices while network positioning does not, so it explains a track that degrades
 or stops indoors rather than justifying a refusal to start.
 
 Both are emitted on change through `TrackerEvent.ProviderChange`, like the rest of this
+`locationPowerSaveMode` is what battery saver does to location
+(`PowerManager.getLocationPowerSaveMode()`), and it is the OEM's choice: `NO_CHANGE`,
+`GPS_DISABLED_WHEN_SCREEN_OFF`, `ALL_DISABLED_WHEN_SCREEN_OFF`, `FOREGROUND_ONLY`,
+`THROTTLE_REQUESTS_WHEN_SCREEN_OFF`, or `UNKNOWN` (battery saver on below API 28). Always
+`NO_CHANGE` while `powerSaveMode` is off. The two screen-off "disabled" modes stop or cut
+background tracking for as long as the screen is off. The SDK cannot override them, so ask
+the user to turn battery saver off during a shift. The log channel records the mode on every
+`DEVICE_LOCATION` and provider line, and logs those two modes at `WARN`.
+
+All three are emitted on change through `TrackerEvent.ProviderChange`, like the rest of this
 object; there is no polling.
 
 ### 7.4 `TrackerResult` and `ErrorCode`
@@ -1033,6 +1073,7 @@ sealed interface TrackerResult<out T> {
 | `LOCATION_DISABLED` | GPS and network providers both off |
 | `PLAY_SERVICES_UNAVAILABLE` | Fused provider unavailable — switch to `GPS_ONLY` |
 | `FGS_START_REFUSED` | The OS refused the foreground service start |
+| `FGS_START_REFUSED` | The OS refused the foreground service start. With a session open the SDK posts a tap-to-resume notification (`showRecoveryNotification`) |
 | `NOTIFICATION_HIDDEN` | The foreground notification is not visible |
 | `FIX_TIMEOUT` | No usable fix within `oneShotTimeoutMs` |
 | `STORAGE_FULL` | No room to persist |
@@ -1163,6 +1204,7 @@ data class PointQuery(
 | `MotionQuality` | `FULL`, `DEGRADED`, `POOR` |
 | `GeofenceTransition` | `ENTER`, `EXIT` |
 | `WakeResult` | `ALIVE`, `REVIVED`, `REFUSED`, `NO_SESSION`, `DISABLED`, `DISPATCHED`, `TIMED_OUT` — see [§12.4](#124-remote-wake--fcm) |
+| `WakeResult` | `ALIVE`, `REVIVED`, `REFUSED`, `NO_SESSION`, `DISABLED`, `DISPATCHED`, `TIMED_OUT`, `LOCATION_OFF` — see [§12.4](#124-remote-wake--fcm) |
 
 `ActivityType` is **enrichment only, never a capture gate** — some devices report entire
 17-minute drives as `STILL` under battery saver.
@@ -1614,8 +1656,11 @@ class AppMessagingService : FirebaseMessagingService() {
 | `WakeResult` | Meaning |
 |---|---|
 | `ALIVE` | The service was running. A fix and an upload drain were requested |
+| `ALIVE` | The service was running. An upload drain was requested, and a forced fix too — unless the stream had already delivered within its own interval, in which case the fix is skipped (the stream's own fix covers it; counted as `remoteWakeOneShotsSkipped` in [`PowerReported`](#71-trackerevent--the-event-flow)) |
 | `REVIVED` | A session was open with no service behind it; the service was started |
 | `REFUSED` | The platform refused the start. The SDK's counted restore path is queued and retries with backoff |
+| `REFUSED` | The platform refused the start — at `startForegroundService`, or at the service's own `startForeground` inside the wake window. The SDK's counted restore path is queued and retries with backoff |
+| `LOCATION_OFF` | A session is open but location services are off. No fix was requested and no service started (a running one is left as it is and resumes capture by itself); queued uploads were still drained. **Stop pushing this device** until it next reports a point — a push cannot turn location back on |
 | `NO_SESSION` | No session is open. Nothing was started — **a wake never starts a session** |
 | `DISABLED` | `service.foregroundService = false`; nothing to start |
 | `DISPATCHED` | Called on the main thread, so it ran in the background instead of blocking |
@@ -3709,3 +3754,4 @@ fire and the runtime waiver already applies.
 | Server sends idle pushes but `last_seen` never moves | Nothing on the device handles them, the message has a `notification` block, or it is not high priority | Handle it with `Tracker.wake()` and send data-only, high-priority messages ([§12.4](#124-remote-wake--fcm)) |
 | `remote wake: NO_SESSION` in the log | The push arrived, but no session was open on the device | Expected after end-of-day or a sign-out. Stop pushing to that device |
 | `remote wake: REFUSED` in the log | The platform refused the foreground-service start — usually a normal-priority message, or an OEM rule | Confirm `"priority": "high"`. The SDK retries on its own restore path |
+
