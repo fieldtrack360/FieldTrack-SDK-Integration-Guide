@@ -34,7 +34,6 @@ map rendering, and an upload (sync) engine.
 - [End-to-end example](#end-to-end-example)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
-- [Security](#security)
 - [License](#license)
 
 ---
@@ -56,7 +55,7 @@ map rendering, and an upload (sync) engine.
 | React Native | **0.81+** with New Architecture enabled | Developed and verified against RN **0.87** |
 | Node | 22+ | Needed for the iOS framework fetch on install |
 | iOS | **17.0** | The vendored XCFrameworks target `arm64-apple-ios17.0` and are not weak-linked |
-| Xcode / CocoaPods | Xcode 26+, CocoaPods 1.15+ | |
+| Xcode / CocoaPods | **Xcode 27.1+** (Swift 6.4), CocoaPods 1.15+ | The pinned iOS SDK is built with Swift 6.4; an older Xcode cannot read its module interfaces |
 | Android | **minSdk 26**, **compileSdk 36**, target 36 | The config plugin raises `minSdkVersion`/`compileSdkVersion` for you; it never lowers them |
 | Kotlin | **2.0+** (verified: 2.1.20) | React Native's own pin is enough — no override needed |
 | AGP | **8.x+** (verified: 8.11) | |
@@ -138,7 +137,72 @@ override fun onCreate() {
 from JS re-applies real config and is safe. It becomes **required**, not optional, if you use
 [headless events](#headless-events--android-only).
 
-**Nothing else.** The foreground service, the boot receiver, the activity/geofence receivers and
+**3 — (Recommended) take WorkManager off the cold-start path.** A manifest block, no Kotlin. In
+`android/app/src/main/AndroidManifest.xml`, add the `tools` namespace to `<manifest>` and this inside
+`<application>`:
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+    </application>
+</manifest>
+```
+
+WorkManager otherwise initialises itself from a `ContentProvider` on the main thread of **every cold
+start**, before `Application.onCreate`. The tracking service is started with
+`startForegroundService()`, and the platform's ~10 second start-foreground deadline opens at that
+call — while the process is very often starting cold to answer it (sticky restart, boot, OEM
+revival). Overrun it and the system kills the app with
+`ForegroundServiceDidNotStartInTimeException`, which the SDK cannot catch.
+
+**The SDK alone does not need `Configuration.Provider`.** Since Android SDK `1.0.10-alpha06` it
+initialises WorkManager with the default configuration the first time *it* needs a handle. That
+covers the SDK and nothing else: WorkManager only honours `Configuration.Provider` on your
+`Application` class, so no library can supply it for you.
+
+**Any other WorkManager user in your app needs `Configuration.Provider` alongside the block.** Your
+own workers, or a library such as `@notifee/react-native` or `react-native-maps` tile caching, can
+call `WorkManager.getInstance()` before the SDK has, and that call throws
+`IllegalStateException: WorkManager is not initialized properly`. Some libraries catch it and fail
+silently. Notifee does exactly that when Android starts the app in the background to deliver a
+notification-blocked broadcast: the event is dropped, and `onBackgroundEvent` never sees
+`APP_BLOCKED` / `CHANNEL_BLOCKED`. Implementing the provider makes WorkManager initialise lazily on
+the first call from *any* caller and keeps the cold-start saving:
+
+```kotlin
+// android/app/src/main/java/.../MainApplication.kt
+import androidx.work.Configuration
+
+class MainApplication : Application(), ReactApplication, Configuration.Provider {
+  override val workManagerConfiguration: Configuration
+    get() = Configuration.Builder().build()
+  // ...
+}
+```
+
+```groovy
+// android/app/build.gradle — libraries keep WorkManager implementation-scoped, so the app must
+// declare it to see Configuration. Use the version your build already resolves
+// (./gradlew :app:dependencies | grep work-runtime).
+implementation("androidx.work:work-runtime:2.10.2")
+```
+
+If you cannot tell whether anything else uses WorkManager, add the provider anyway or leave the
+block out — both are safe. The block without the provider is safe only when the SDK is the sole
+WorkManager user.
+
+**Nothing else is required.** The foreground service, the boot receiver, the activity/geofence receivers and
 every permission merge in from the AAR manifest — see [Permissions](#permissions).
 
 ### iOS setup
@@ -276,7 +340,7 @@ Tracker is licensed software. Read the enforcement table below before you build 
 
 ### Getting a licence
 
-Buy one at **<https://sdk.fieldtrack360.com/>**. Plans and prices live there; two things about a key change how you wire this
+Buy one at **<https://sdk.tracksdkhub.com/>**. Plans and prices live there; two things about a key change how you wire this
 package up:
 
 - **One key covers both platforms**, so you supply exactly one token — which is why there is a single `license` field.
@@ -305,7 +369,7 @@ wins over a stale one left on disk.
 
 > **Token prefix.** Tokens are currently issued with a **`TRACKIT-`** prefix. If a token you were
 > issued starts with anything else, check it against what
-> [the licence portal](https://sdk.fieldtrack360.com/) gave you before you cut a release.
+> [the licence portal](https://sdk.tracksdkhub.com/) gave you before you cut a release.
 
 ### What actually gets enforced
 
@@ -339,7 +403,7 @@ On Android the release-only **integrity** layer can additionally end an in-fligh
 
 Both platforms run the online revocation check. It never blocks startup and is **fail-open** — no
 network, an unverifiable reply or a server error all leave the tracker recording. See
-[Licence status on Android](#licence-status-on-android) for the readback surface.
+[Online licence check](#online-licence-check) for the readback surface.
 
 ### Getting the token into JS
 
@@ -387,7 +451,7 @@ at build time and readable by anyone who unpacks your app. That is expected. The
 your application id and signed, so a copy is worth nothing in another app — it is still worth what
 you paid, so do not commit it.
 
-### Licence status on Android
+### Online licence check
 
 **Both** platforms run an **online** check alongside the offline gate: the SDK asks the licence
 server whether the token has been revoked or expired since it was issued, and stops tracking with
@@ -423,6 +487,11 @@ there. Instead iOS speaks up only to deactivate, through `licenseDeactivated` (a
 string plus the admin's note) and the matching `error` code, and refuses `start()` until the server
 reports the licence active again. Do not write one handler assuming both shapes.
 
+`LicenseInfo` is `{ status, valid, packageName, checkedAt, ttlSeconds, reason, fromCache }` — see
+[Types](#types). `status` is one of `'active' | 'revoked' | 'expired' | 'unknownKey' | 'invalidKey' |
+'packageMismatch' | 'sdkMismatch' | 'unrecognised'` (`unrecognised` = a status this client does not
+know yet).
+
 ---
 
 ## Initialization and ready state
@@ -434,7 +503,10 @@ Initialization is **two-phase**:
 | A — launch hook | Native. `TrackerLaunch.ready()` (iOS, **required**) / `TrackerLaunch.ready(context)` (Android, optional) | Registers `BGTaskScheduler` handlers inside the launch window (iOS); restores filter state at `onCreate` timing (Android). Uses bundled/default config. |
 | B — JS ready | `await Tracker.ready(config?)` | Applies your real `TrackerConfig`, verifies the licence, returns the first `TrackerState`. |
 
-Everything else is gated on phase B: calls made before it fail with `notReady`.
+Everything else is gated on phase B: calls made before it fail with `notReady`. One exception on
+iOS: `getCurrentLocation()` works before `ready()`, gated on location authorization alone — it
+returns `permissionDenied` when that is denied, restricted or not yet requested, never prompts,
+and does not store the fix.
 
 ```ts
 import Tracker, { onStateChange, type TrackerState } from '@fieldtrack360/react-native-tracker';
@@ -487,7 +559,7 @@ UI or rationale.
 
 ### Android
 
-Not requried to add permissions in your manifest file. it's merged from itself:
+You do not need to add these to your manifest — they merge in from the SDK's AAR:
 
 ```xml
 <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
@@ -507,6 +579,102 @@ plus the tracking foreground service (`foregroundServiceType="location"`), the b
 (`BOOT_COMPLETED`, `MY_PACKAGE_REPLACED`) and the activity-transition / stationary-fence
 receivers. `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` is deliberately **not** declared — it is
 Play-policy sensitive and must be your explicit choice.
+
+### Battery optimisation — Android only
+
+Background tracking on OEM builds usually stops because of battery policy, not permissions.
+`Tracker.android.getBackgroundRestrictions()` reads that state with no permission, and two methods
+open the remedy:
+
+```ts
+const r = await Tracker.android.getBackgroundRestrictions();
+// { ignoringBatteryOptimizations, backgroundRestricted, standbyBucket, degraded }
+if (r.degraded || !r.ignoringBatteryOptimizations) {
+  // One-tap dialog when your manifest declares REQUEST_IGNORE_BATTERY_OPTIMIZATIONS;
+  // false (nothing shown) otherwise, or when the exemption is already held.
+  if (!(await Tracker.android.requestBatteryOptimizationExemption())) {
+    await Tracker.android.openBatteryOptimizationSettings();   // always works, two taps
+  }
+}
+```
+
+**`ignoringBatteryOptimizations: false` is the normal state of almost every app** and not a fault on
+its own — `degraded` (background-restricted, or standby bucket rare/restricted) ignores it
+deliberately. Gate a warning on `degraded`; treat the exemption as a remedy to offer.
+
+Declare `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` in your own manifest only if your app qualifies under
+Play policy (a core feature that cannot work under Doze). Without it,
+`requestBatteryOptimizationExemption()` resolves `false` rather than launching an intent that throws
+on some OEMs and silently does nothing on others. Re-read `getBackgroundRestrictions()` when your
+screen regains focus to reflect what the user changed.
+
+### Remote wake (FCM) — Android only
+
+A process that an OEM battery manager has frozen, or that Android has parked in Doze, uploads
+nothing and notices nothing. The device cannot see that gap; your server can — an open shift with
+no upload for N minutes. Of the ways to wake an Android app, only a **high-priority FCM data
+message** gets through Doze, and it is one of the few things that lets an app start a foreground
+service from the background on API 31+.
+
+Neither this package nor the SDK depends on Firebase. You own FCM (typically
+`@react-native-firebase/messaging`) and hand the message to `Tracker.android.wake()`:
+
+```js
+// index.js — top level, next to AppRegistry.registerComponent
+import messaging from '@react-native-firebase/messaging';
+import { Platform } from 'react-native';
+import { Tracker } from '@fieldtrack360/react-native-tracker';
+
+messaging().setBackgroundMessageHandler(async (message) => {
+  if (Platform.OS === 'android' && message.data?.type === 'fieldtrack_wake') {
+    await Tracker.android.wake();
+  }
+});
+```
+
+Send the FCM token to your backend against the signed-in user and device (`messaging().getToken()`
+and `onTokenRefresh`). `wake()` needs no `ready()` and is safe in a cold process. It decides whether
+there is anything to do and resolves a `WakeResult`:
+
+| `WakeResult` | Meaning |
+|---|---|
+| `alive` | The service was running. A fix and an upload drain were requested |
+| `revived` | A session was open with no service behind it; the service was started |
+| `refused` | The platform refused the start. The SDK's own restore path is queued and retries with backoff |
+| `noSession` | No session is open. Nothing was started — **a wake never starts a session** |
+| `disabled` | `android.foregroundService` is `false`; nothing to start |
+| `timedOut` | The session lookup did not finish within ~8 s; nothing was started |
+| `locationOff` | A session is open but location services are off; no fix was requested and nothing was started. An upload of anything already queued was still requested. Stop pushing this device until it next reports a point |
+
+Each call is written to the [session log](#session-logs--android-only) as a `Tracker` line,
+`remote wake: <RESULT>` (the SDK's own casing, e.g. `NO_SESSION`) — that line is how you tell whether a push reached the device at all.
+
+**What the server must send.** Data-only and high priority. A `notification` block makes Android
+display the message itself while the app is in the background, and the handler is never called.
+Normal priority waits until Doze ends.
+
+```json
+{ "message": {
+    "token": "<device FCM token>",
+    "android": { "priority": "high", "ttl": "300s" },
+    "data": { "type": "fieldtrack_wake" } } }
+```
+
+**When to send it.** On *no upload or heartbeat for N minutes while a shift is open* — never on *no
+movement*: a parked user legitimately stores nothing, and pushing at a healthy device wastes the
+high-priority budget. Back off (for example 3 → 6 → 12 → 30 min) and stop once the device's
+last-seen time moves. FCM may downgrade high-priority messages that rarely lead to anything the user
+sees; a revival posts the tracking notification, which counts.
+
+**What it cannot do.** It cannot reach a **force-stopped** app — Android delivers no FCM to a stopped
+package until the user opens it. Some OEM killers (ColorOS `o-kill`, some MIUI paths) amount to a
+force-stop; there only the [battery-optimisation exemption](#battery-optimisation--android-only) and
+the OEM's auto-launch / background-activity toggle keep tracking alive.
+
+**Cold start.** `firebase-messaging` adds `FirebaseInitProvider` to every cold start of your process,
+inside the window before the tracking service must promote to the foreground. It is normally tens of
+milliseconds; measure it on your slowest device. A JS background handler also pays for starting the
+React Native runtime before `wake()` runs.
 
 ### iOS — declared by you
 
@@ -659,6 +827,8 @@ import { name as appName } from './app.json';
 
 AppRegistry.registerComponent(appName, () => App);
 
+// The handler receives a HeadlessEvent: { name: TrackerEvent['type'], params: TrackerEvent }.
+// It registers under HEADLESS_TASK_KEY ('TrackerHeadless'), also exported.
 registerHeadlessTask(async ({ name, params }) => {
   // The task ends — and the native wake lock is released — when this promise settles.
   // AWAIT EVERYTHING. Work left in flight is killed mid-request.
@@ -719,6 +889,27 @@ if (fix.ok) {
 with a session open this adds a judged point to it — nothing is bypassed, but a screen that asks
 "where am I" grows the user's track each time it opens. Android's one-shot is snapshot-only: never
 accepted, persisted, added to the odometer, or emitted.
+
+### Battery
+
+```ts
+import Tracker, { onBatteryChange, onBatteryThreshold } from '@fieldtrack360/react-native-tracker';
+
+const battery = await Tracker.getBatteryInfo();   // { percent, isCharging, powerSource, isLow }
+
+const unsubBattery = onBatteryChange((b) => setBattery(b));   // current value on subscribe, then changes
+
+// Your own cutoffs. Fires ONCE per crossing, not on every reading: 22% → 19% fires
+// { threshold: 20, crossing: 'below' } once; staying between thresholds stays silent.
+const unsubThreshold = onBatteryThreshold([20, 5], ({ percent, threshold, crossing }) => {
+  if (crossing === 'below') console.warn(`battery ${percent}% dropped below ${threshold}%`);
+});
+```
+
+`percent` and `isCharging` are `null` when **not known** (simulator, monitoring off) — never coalesce
+them to `0` / `false`. `onBatteryThreshold` skips `null` readings, and the first reading only sets the
+baseline, so nothing fires until the level actually moves across a threshold. `isLow` is the SDK's
+fixed cutoff (`percent <= 15`).
 
 ### Reading stored points
 
@@ -944,9 +1135,31 @@ import { TrackMapView, LiveTrackMapView } from '@fieldtrack360/react-native-trac
 | Prop | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `track` | `Track` | **yes** | — | The object returned by `Tracker.buildTrack()`. Serialised to the native view; the renderer never recomputes geometry |
-| `options` | `object` | no | — | Renderer styling. **Platform-divergent and intentionally unmerged** — an iOS `RenderOptions`-shaped object on iOS, an Android `RendererOptions`-shaped object on Android. Passed through as-is |
+| `options` | `object` | no | SDK defaults | Renderer styling. **Platform-divergent and intentionally unmerged** — keys differ per platform (table below). Unknown keys are ignored; omitted keys keep the SDK default |
 | `onArrowZoom` | `(zoom: number) => void` | no | — | The renderer needs direction arrows rebuilt at a new zoom. Rebuild with `buildTrack(query, { ...options, zoom })` and pass the **new** `track` — do not rescale |
 | …`ViewProps` | | | | `style`, `testID`, etc. `children` is not supported |
+
+`options` keys for `<TrackMapView>`:
+
+| iOS | Android |
+|---|---|
+| `showArrows: boolean`, `showStopPins: boolean` | `showArrows: boolean`, `showStopMarkers: boolean` |
+| `arrowSize`, `stopPinSize: number` | `arrowSizePx: number` |
+| `basePathWidth`, `speedOverlayWidth: number` | `basePathWidth`, `speedOverlayWidth: number` |
+| `speedOverlayOpacity: number` (0–1) | `speedOverlayAlpha: number` (0–255) |
+| `cameraPadding`, `twoPointCameraPadding: number` | `cameraPaddingPx`, `cameraPaddingFallbackPx: number` |
+| `ongoingPulseSeconds: number` | — |
+| `gapLineWidth: number`, `gapDashLengths: number[]` | — |
+| Colours (hex `'#RRGGBB'` / `'#RRGGBBAA'`): `basePathColor`, `gapColor`, `speedBandGreen`, `speedBandYellow`, `speedBandRed` | Colours not configurable yet |
+
+```tsx
+<TrackMapView
+  track={track}
+  options={Platform.OS === 'ios'
+    ? { showStopPins: false, basePathWidth: 6, basePathColor: '#1B1B1F' }
+    : { showStopMarkers: false, basePathWidth: 6 }}
+/>
+```
 
 ```tsx
 function TrackMap({ sessionId }: { sessionId: string }) {
@@ -978,11 +1191,25 @@ function TrackMap({ sessionId }: { sessionId: string }) {
 | Prop | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `update` | `LiveTrackUpdate` | no | — | The latest frame from `onLiveTrack`. **Android** rebuilds the render from it; **iOS** reads the native live stream directly and treats this as a liveness signal only |
-| `followMode` | `'none' \| 'follow' \| 'followBearing'` | no | native default | Camera behaviour |
+| `followMode` | `'none' \| 'follow' \| 'followBearing'` | no | `'none'` | Camera behaviour: `none` leaves the camera alone, `follow` keeps the puck centred, `followBearing` also rotates to the heading |
 | `initialCentre` | `{ latitude: number; longitude: number }` | no | — | Camera centre before the first frame arrives |
-| `options` | `object` | no | — | Live renderer styling. Platform-divergent (iOS `followDistanceMeters`/`followPitchDegrees` vs Android `followZoom`/`followTilt`); no lossless mapping, so it is not unified |
+| `options` | `object` | no | SDK defaults | Live renderer styling. Platform-divergent — keys in the table below |
 | `onFollowingChange` | `(isFollowing: boolean) => void` | no | — | **iOS only** — fires when the user pans away from the puck. Android has no follow-state callback and never emits it |
 | …`ViewProps` | | | | `children` is not supported |
+
+`options` keys for `<LiveTrackMapView>`:
+
+| iOS | Android |
+|---|---|
+| `tailWidth`, `headWidth: number` | `tailWidth`, `headWidth: number` |
+| `puckSize: number` | `puckSizePx: number` |
+| `haloFillOpacity`, `haloStrokeOpacity: number` | `showAccuracyHalo: boolean` |
+| `lookaheadMs`, `animationDurationMs: number` | `lookaheadMs`, `animationDurationMs: number` |
+| `followDistanceMeters`, `followPitchDegrees: number` | `followZoom`, `followTilt: number` |
+| Colours (hex): `tailColor`, `headColor`, `puckColor`, `haloColor` | Colours not configurable yet |
+
+The follow-camera framing has no lossless mapping between platforms (distance/pitch vs zoom/tilt),
+which is why `options` is not unified.
 
 ```tsx
 function LiveMap() {
@@ -1017,6 +1244,11 @@ function LiveMap() {
 Fences are independent of tracking: they need `ready()` and authorization, fire with **no session
 open**, and survive reboot. The usable cap is **19** (one of the platform's 20 slots is reserved
 for the SDK's stationary fence).
+
+**Do not reuse the stationary fence's id for a fence of your own** — `'fieldtrack-stationary'` on
+Android, or whatever you set as `android.stationaryGeofenceId`. On Android an EXIT on that id is how
+a parked, killed process learns the user has driven off, and the SDK recognises it by id alone, so a
+fence of yours under the same id is treated as the wake fence too.
 
 ```ts
 const added = await Tracker.geofences.add({
@@ -1080,11 +1312,34 @@ switch (result.kind) {
   case 'forbidden':   /* Android only, 403 — reconfigure; the queue is intact */ break;
 }
 
+// Shapes: { kind: 'uploaded', count } · { kind: 'empty' } · { kind: 'retry', reason }
+//         · { kind: 'authExpired' } · { kind: 'forbidden' } (Android only)
+
 const pending = await TrackerSync.pendingCount();   // TrackerResult<number>
 
 // Both platforms. Only `httpResponse` arrives on Android; the other three types are iOS-only.
 const unsub = TrackerSync.onSyncEvent((e) => console.log(e.type));
 ```
+
+**`SyncConfig` fields**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `url` | `string` | — (**required**) | Android: a relative url resolves against `TrackerConfig.android.baseUrl`; an absolute url always wins |
+| `method` | `string` | `'POST'` | Android accepts only `POST` / `PUT` / `PATCH`; iOS passes any verb through |
+| `headers` | `Record<string, string>` | — | Static — call `configure()` again to rotate a token |
+| `extraParams` | `Record<string, SyncParamValue>` | — | Merged into the top level of the body — see below |
+| `autoSync` | `boolean` | `true` | Omitting it does **not** mean off. With `false`, drive uploads via `syncNow()` / `requestSync()` |
+| `batchSize` | `number` | `100` | Android requires `1..1000` |
+| `ios.requiresNetworkConnectivity` | `boolean` | SDK default | iOS gate: any connectivity |
+| `ios.wipeOnAuthExpiry`, `ios.stopTrackingOnAuthExpiry` | `boolean` | SDK default | iOS reaction to a 401 |
+| `ios.backoffInitialSec`, `ios.backoffCeilingSec` | `number` | SDK default | Retry backoff |
+| `ios.autoSyncCoalesceSec` | `number` | SDK default | Coalesces auto-sync triggers |
+| `android.requiresUnmeteredNetwork` | `boolean` | SDK default | Android gate: **unmetered only** — not the same policy as the iOS gate |
+| `android.syncLogs` | `boolean` | `true` | Also set up the [session-log channel](#session-logs--android-only) |
+| `android.gzipRequestBody` | `boolean` | `false` | Sends `Content-Encoding: gzip`. Turn on only once your endpoint decompresses — otherwise it answers 400 or stores compressed bytes |
+| `android.allowCleartext` | `boolean` | `false` | Permit `http://`. Without it an `http://` url fails at runtime and retries forever. Loopback hosts (`localhost`, `127.0.0.1`, `::1`, `10.0.2.2`) are exempt. Local development only |
+| `android.timeouts` | `{ connectMs?, readMs?, writeMs? }` | `5000` / `30000` / `20000` | Each must be `> 0` |
 
 ### `extraParams` — your own fields in the request body
 
@@ -1192,6 +1447,34 @@ safe to point at a different endpoint with different credentials.
 404/405/501 means there is no endpoint at that URL. Either way the buffer is kept and tracking is
 untouched; recover with a fresh `configureLogs()`.
 
+**`LogSyncConfig` fields** — every field is optional; `configureLogs()` with no argument uses all
+defaults.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `url` | `string` | points origin + `v1/logs/batch` | A relative path resolves the same way |
+| `deviceId` | `string` | inherited from points `extraParams.device_id` | A different id produces two unrelated datasets |
+| `method` | `string` | `'POST'` | |
+| `headers` | `Record<string, string>` | points headers | |
+| `autoSync` | `boolean` | `true` | 15-minute heartbeat. `false` → drive via `syncLogsNow()` / `requestLogSync()` |
+| `level` | `'debug' \| 'info' \| 'warn' \| 'error'` | `'info'` | Minimum severity **kept** |
+| `types` | `('event' \| 'decision' \| 'message' \| 'lifecycle')[]` | `['event', 'lifecycle', 'message']` | See the `decision` warning below |
+| `bufferCapacity` | `number` | `5000` | Rows held before the oldest are dropped |
+| `retentionHours` | `number` | `72` | |
+| `batchSize` | `number` | `200` | Endpoint ceiling 500; a larger batch is rejected permanently |
+| `uploadIntervalMinutes` | `number` | `15` | 15 is also the floor (WorkManager limit) |
+| `nudgeLevel` | `LogLevel \| null` | `'warn'` | An entry at this level or worse uploads straight away. `null` disables |
+| `nudgeCooldownMs` | `number` | `30000` | Throttle on the nudge; a burst inside it is deferred, not dropped |
+| `requiresUnmeteredNetwork` | `boolean` | SDK default | |
+| `gzipRequestBody` | `boolean` | **`true`** | The inverse of the points channel's default |
+| `allowCleartext` | `boolean` | `false` | |
+| `timeouts` | `{ connectMs?, readMs?, writeMs? }` | SDK defaults | |
+| `extraParams` | `Record<string, SyncParamValue>` | — | Same rules as the points channel |
+
+`LogType`: `event` = `TrackerEvent`s (permission/provider changes, errors), `lifecycle` =
+session/service/process phases, `message` = your `log()` calls, `decision` = the SDK's per-fix
+decision log.
+
 **Filtering happens at record time, not upload time** (`level`, `types`), so raising `level` later
 does not retroactively drop what is already buffered. Uploads are a 15-minute heartbeat, except
 that an entry at `nudgeLevel` (`'warn'` by default) asks for one straight away, throttled to one
@@ -1217,7 +1500,10 @@ worth knowing about, because they are what answer "this device never records any
   A `start()` refused at the permission gate opens no session, so this one is filed against the
   device with a **null `sessionId`**. It is `'warn'` whenever the state would stop or degrade
   tracking, so it survives the default `level: 'info'`. A granted start writes one line per session;
-  a refused start writes every time.
+  a refused start writes every time. Since Android SDK `1.0.10-alpha06` it also carries the
+  battery-policy state — `battery_optimised`, `background_restricted`, `standby_bucket` in `data`
+  (each `null` when unreadable) — so the same row explains a session that started fine and stopped
+  an hour later. It escalates to `'warn'` on `degraded`, never on the exemption alone.
 - `'device_motion'` — the device's motion hardware, once per session. It explains a gap *inside* a
   session, where `'device_location'` explains a session that never opened.
 
@@ -1231,8 +1517,13 @@ Server contract: `v1/logs/batch`, documented in the Android SDK's `docs/APP-LOG-
 
 ## Complete API reference
 
-Every method below is on the default export (`Tracker`). All return Promises. Unless stated,
-availability is **both platforms**.
+Methods below are on the default export `Tracker` (the top-level methods and subscriptions are also named exports). Methods return
+Promises; subscriptions return an **unsubscribe function**; `registerHeadlessTask` returns `void`.
+`TrackerSync` is a separate named export. Unless stated, availability is **both platforms**.
+
+```ts
+import Tracker, { TrackerSync, TrackMapView, LiveTrackMapView, onTrackerEvent } from '@fieldtrack360/react-native-tracker';
+```
 
 ### Lifecycle
 
@@ -1257,7 +1548,7 @@ availability is **both platforms**.
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `getCurrentLocation()` | — | `Promise<TrackerResult<TrackFix>>` | **iOS also stores the fix** on the open session; Android reports it only. iOS failures name themselves — `fixTimeout` is retryable, `oneShotBusy` / `oneShotCircuitOpen` / `fixRejected` are not |
+| `getCurrentLocation()` | — | `Promise<TrackerResult<TrackFix>>` | **iOS also stores the fix** on the open session (not before `ready()`); Android reports it only. iOS failures name themselves — `fixTimeout` is retryable, `oneShotBusy` / `oneShotCircuitOpen` / `fixRejected` are not |
 
 ### Plotting
 
@@ -1327,10 +1618,18 @@ availability is **both platforms**.
 
 | Method | Parameters | Returns |
 |---|---|---|
+| `integrity()` | — | `Promise<IntegrityReport>` — last evaluation, cheap. Check `waived` first: on a debuggable build nothing is probed |
+| `checkIntegrity()` | — | `Promise<IntegrityReport>` — forces a re-evaluation (reads `/proc`, the package list, a loopback socket); keep it behind a user action |
+| `licenseInfo()` | — | `Promise<LicenseInfo \| null>` — cached online-licence verdict; `null` = not checked yet, **not** a refusal. No network |
+| `checkLicense()` | — | `Promise<LicenseInfo \| null>` — forces a server check; fail-open (returns the cached verdict when offline) |
 | `hasActivityRecognition()` | — | `Promise<boolean>` |
 | `requestActivityRecognition()` | — | `Promise<boolean>` |
 | `hasNotificationPermission()` | — | `Promise<boolean>` |
 | `requestNotification()` | — | `Promise<boolean>` (no-op below Android 13) |
+| `getBackgroundRestrictions()` | — | `Promise<BackgroundRestrictions>` |
+| `openBatteryOptimizationSettings()` | — | `Promise<boolean>` |
+| `requestBatteryOptimizationExemption()` | — | `Promise<boolean>` — `false` and nothing shown when `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` is not in your manifest or the exemption is already held |
+| `wake()` | — | `Promise<WakeResult>` — remote wake from a high-priority FCM data message; needs no `ready()`, never starts a session. See [Remote wake (FCM)](#remote-wake-fcm--android-only) |
 
 ### Subscriptions
 
@@ -1341,13 +1640,14 @@ deliver the current value on subscribe.
 
 | Function | Callback | Notes |
 |---|---|---|
-| `onTrackerEvent(cb)` | `(event: TrackerEvent) => void` | The 19-case union below |
+| `onTrackerEvent(cb)` | `(event: TrackerEvent) => void` | The 22-case union below |
 | `onLiveTrack(cb)` | `(update: LiveTrackUpdate) => void` | Feed straight into `<LiveTrackMapView>` |
 | `onPoints(sessionId, cb)` | `(points: TrackPoint[]) => void` | Stored points for one session |
 | `onStateChange(cb)` | `(state: TrackerState) => void` | |
 | `onProviderStateChange(cb)` | `(state: ProviderState) => void` | |
 | `onBatteryChange(cb)` | `(battery: BatteryInfo) => void` | Both platforms |
-| `registerHeadlessTask(task)` | `(event: { name, params }) => Promise<void>` | **Android only.** Events with no UI process — see [Headless events](#headless-events--android-only). No unsubscribe: register once in `index.js` |
+| `onBatteryThreshold(thresholds, cb)` | `thresholds: number[]`, `(c: BatteryThresholdCrossing) => void` | Fires once per crossing of each threshold; `null` readings skipped. See [Battery](#battery) |
+| `registerHeadlessTask(task)` | `(event: HeadlessEvent) => Promise<void>` | **Android only.** Events with no UI process — see [Headless events](#headless-events--android-only). No unsubscribe: register once in `index.js` |
 
 ```ts
 type TrackerEvent =
@@ -1356,7 +1656,7 @@ type TrackerEvent =
   | { type: 'motionChange';       state: MotionState; point: TrackPoint | null }
   | { type: 'activityChange';     activity: ActivityType; confidence: number }
   | { type: 'enabledChange';      enabled: boolean }
-  | { type: 'providerChange';     state: ProviderState }
+  | { type: 'providerChange';     state: ProviderState; previous?: ProviderState }  // previous: Android only; absent on the first observation
   | { type: 'heartbeat';          atMs: number }
   | { type: 'powerSaveChange';    enabled: boolean }
   | { type: 'sessionInterrupted'; session: TrackSession }
@@ -1365,12 +1665,18 @@ type TrackerEvent =
   | { type: 'geofenceEnter';      crossing: GeofenceCrossing }
   | { type: 'geofenceExit';       crossing: GeofenceCrossing }
   | { type: 'geofenceDwell';      crossing: GeofenceCrossing }   // iOS only
-  | { type: 'geofenceAdded';      geofence: Geofence }          // radiusM is the CLAMPED value
-  | { type: 'geofenceRemoved';    geofenceId: string }
+  | { type: 'geofenceAdded';      geofence: Geofence }          // both platforms; radiusM is the CLAMPED value
+  | { type: 'geofenceRemoved';    geofenceId: string }          // both platforms; removeAll() emits one per fence
   | { type: 'batteryChange';      battery: BatteryInfo }
   | { type: 'licenseDeactivated'; status: string; reason: string | null }  // iOS only
+  | { type: 'integrityChange';    report: IntegrityReport }     // Android only, release builds; fires on change
+  | { type: 'licenseChecked';     info: LicenseInfo }           // Android only; not emitted when the check could not verify
+  | { type: 'powerReport';        report: PowerReport }         // Android only; every android.powerReportIntervalMin (default 15, 0 = off)
   | { type: 'trackingGap';        durationSec: number; distanceMeters: number };  // iOS only
 ```
+
+Platform-only cases: `geofenceDwell`, `licenseDeactivated`, `trackingGap` (iOS);
+`integrityChange`, `licenseChecked`, `powerReport` (Android). `TrackerEventType` is `TrackerEvent['type']`.
 
 A case that is absent on a platform simply never arrives — do not build a liveness assumption on
 one.
@@ -1381,7 +1687,7 @@ one.
 |---|---|---|---|
 | `configure(config)` | `SyncConfig` | `Promise<void>` | Rejects `invalidConfig` on bad JSON, an unparseable iOS url, a failed Android `SyncConfig.validate()` (cleartext url, verb outside POST/PUT/PATCH, batchSize out of range), or an `extraParams` value the platform cannot encode |
 | `requestSync()` | — | `Promise<void>` | Call after accepted points even with `autoSync` on |
-| `syncNow()` | — | `Promise<SyncResult>` | `uploaded` / `empty` / `retry` / `authExpired`, plus `forbidden` (**Android only**) |
+| `syncNow()` | — | `Promise<SyncResult>` | `{ kind: 'uploaded', count }` / `{ kind: 'empty' }` / `{ kind: 'retry', reason }` / `{ kind: 'authExpired' }`, plus `{ kind: 'forbidden' }` (**Android only**) |
 | `pendingCount()` | — | `Promise<TrackerResult<number>>` | |
 | `onSyncEvent(cb)` | `(e: SyncEvent) => void` | `() => void` | Both platforms; only `httpResponse` is emitted on Android |
 | `ios.onSyncEvent(cb)` | `(e: SyncEvent) => void` | `() => void` | **Deprecated** alias for `onSyncEvent` |
@@ -1392,15 +1698,15 @@ Session logs — **Android only**, Android SDK 1.0.10. Every one of these reject
 
 | Method | Parameters | Returns | Notes |
 |---|---|---|---|
-| `android.configureLogs(config?)` | `LogSyncConfig` | `Promise<void>` | Overrides the channel `configure()` derived, and wins permanently over later `configure()` calls. With no argument, follows the points endpoint (`v1/logs/batch`) and inherits its `device_id` and headers. Rejects `invalidConfig` on bad JSON or a failed `LogSyncConfig.validate()` |
+| `android.configureLogs(config?)` | `config?: LogSyncConfig` (default `{}`) | `Promise<void>` | Overrides the channel `configure()` derived, and wins permanently over later `configure()` calls. With no argument, follows the points endpoint (`v1/logs/batch`) and inherits its `device_id` and headers. Rejects `invalidConfig` on bad JSON or a failed `LogSyncConfig.validate()` |
 | `android.disableLogSync()` | — | `Promise<void>` | Stops shipping, cancels the worker; the buffer is kept |
 | `android.log(entry)` | `{ level, tag, message, code?, data? }` | `Promise<void>` | `data` must be a JSON structure as a string. An entry at `nudgeLevel` or worse asks for a drain immediately |
 | `android.logLifecycle(phase, tag?)` | `LifecyclePhase \| string`, `string` | `Promise<void>` | `tag` defaults to `"Host"`. `'device_location'` and `'device_motion'` are written by the SDK itself — don't send them |
 | `android.getLogs(opts?)` | `{ sessionId?, limit?, offset? }` | `Promise<LogRecord[]>` | Newest-first; defaults limit 200 / offset 0 |
 | `android.pendingLogCount()` | — | `Promise<TrackerResult<number>>` | A different queue from `pendingCount()` — the two numbers are unrelated |
-| `android.syncLogsNow()` | — | `Promise<LogSyncResult>` | `shipped` / `empty` / `retry` / `rejected` — **not** the points channel's four |
+| `android.syncLogsNow()` | — | `Promise<LogSyncResult>` | `{ kind: 'shipped', count }` / `{ kind: 'empty' }` / `{ kind: 'retry', reason, retryAfterMs? }` / `{ kind: 'rejected', statusCode }` — **not** the points channel's four |
 | `android.requestLogSync()` | — | `Promise<void>` | No-op, not an error, when the channel is unconfigured or terminally rejected |
-| `android.logStatus()` | — | `Promise<{ configured, endpoint? }>` | |
+| `android.logStatus()` | — | `Promise<{ configured: boolean; endpoint?: string }>` | |
 | `android.onLogEvent(cb)` | `(e: SyncEvent) => void` | `() => void` | This channel's own stream; only `httpResponse` arrives |
 
 ### Components
@@ -1470,6 +1776,14 @@ type BatteryInfo = {
   powerSource: 'none' | 'ac' | 'usb' | 'wireless' | 'dock' | 'unknown'; isLow: boolean;
 };
 
+/** Android only. `ignoringBatteryOptimizations: false` is the normal state, not a fault — `degraded`
+ *  (background-restricted, or standby bucket >= 40) is the SDK's verdict. `standbyBucket` is null
+ *  below API 28. */
+type BackgroundRestrictions = {
+  ignoringBatteryOptimizations: boolean; backgroundRestricted: boolean;
+  standbyBucket: number | null; degraded: boolean;
+};
+
 type TrackFix = {
   timeMs; monotonicNanos; receivedAtMonotonicNanos: number;
   latitude; longitude; accuracyM: number; altitudeM?; verticalAccuracyM?: number;
@@ -1486,6 +1800,7 @@ type TrackPoint = {
   isCharging?; isMock?: boolean;                 // both platforms; null/absent = NOT KNOWN
   ios?: { isSignificantStop?: boolean };
 };
+
 
 type TrackSession = {
   id: string; startedAtMs: number; endedAtMs?: number; tag?: string;
@@ -1532,6 +1847,21 @@ type GeofenceCrossing = {
   eventName?: string;                                 // absent on a dwell / an unlabelled iOS fence
 };
 
+type GeofenceEventsQuery = { geofenceId?: string; fromMs?: number; toMs?: number; limit?: number; offset?: number };
+type GeofenceEventsWindow = { fromMs?: number; toMs?: number };   // both bounds inclusive
+
+/** Android only. Branch on `status`, not `valid`. */
+type LicenseInfo = {
+  status: LicenseStatus; valid: boolean; packageName: string;
+  checkedAt: string;            // ISO-8601, server clock
+  ttlSeconds: number; reason: string | null; fromCache: boolean;
+};
+
+type BatteryThresholdCrossing = { percent: number; threshold: number; crossing: 'below' | 'above' };
+
+/** Android only — the argument of a registerHeadlessTask() handler. */
+type HeadlessEvent = { name: TrackerEventType; params: TrackerEvent };
+
 type SyncParamValue = string | number | boolean | null | SyncParamValue[] | { [k: string]: SyncParamValue };
 
 type SyncConfig = {
@@ -1540,8 +1870,40 @@ type SyncConfig = {
   ios?: { requiresNetworkConnectivity?: boolean; wipeOnAuthExpiry?: boolean; stopTrackingOnAuthExpiry?: boolean;
           backoffInitialSec?: number; backoffCeilingSec?: number; autoSyncCoalesceSec?: number };
   android?: { requiresUnmeteredNetwork?: boolean;   // the two network gates are NOT the same field
-              syncLogs?: boolean };                  // default TRUE — configure() derives the log channel
+              syncLogs?: boolean;                    // default TRUE — configure() derives the log channel
+              gzipRequestBody?: boolean;             // default false
+              allowCleartext?: boolean;              // default false
+              timeouts?: { connectMs?: number; readMs?: number; writeMs?: number } };
+};   // defaults: see the SyncConfig fields table in Sync
+
+type SyncResult =
+  | { kind: 'uploaded'; count: number } | { kind: 'empty' } | { kind: 'retry'; reason: string }
+  | { kind: 'authExpired' } | { kind: 'forbidden' };   // forbidden: Android only (HTTP 403)
+
+type SyncEvent =
+  | { type: 'httpResponse'; statusCode: number | null; count: number }   // both platforms
+  | { type: 'uploaded'; count: number }                                  // iOS only
+  | { type: 'retryScheduled'; afterSec: number; reason: string }         // iOS only
+  | { type: 'authExpired' };                                             // iOS only
+
+// ── Session logs — Android only ──
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+type LogType = 'event' | 'decision' | 'message' | 'lifecycle';
+type LifecyclePhase = 'session_start' | 'session_stop' | 'session_interrupted' | 'service_start'
+  | 'service_stop' | 'process_start' | 'boot_completed' | 'config_changed'
+  | 'device_motion' | 'device_location';   // the last two are written by the SDK itself
+
+type LogRecord = {
+  id: string; sessionId: string | null; seq: number; timeMs: number;
+  elapsedRealtimeNanos: string;   // string: exceeds JS number precision
+  level: LogLevel; type: LogType; tag: string; code: string | null; message: string;
+  data: string | null;            // raw JSON string — parse in try/catch
 };
+
+type LogSyncResult =
+  | { kind: 'shipped'; count: number } | { kind: 'empty' }
+  | { kind: 'retry'; reason: string; retryAfterMs?: number }
+  | { kind: 'rejected'; statusCode: number };   // terminal for this channel; buffer kept
 ```
 
 **Enums (string unions):** `MotionState` `'stopped'|'moving'|'stopPending'|'stationary'` ·
@@ -1554,12 +1916,26 @@ type SyncConfig = {
 `MotionQuality` `'full'|'degraded'|'poor'` · `MovementStatus` `'steady'|'moving'` ·
 `SegmentType` `'travel'|'stop'|'gap'` (`gap` iOS only) · `Smoothing` `'none'|'spline'|'bezier'` ·
 `CameraFollowMode` `'none'|'follow'|'followBearing'` ·
-`PowerSource` `'none'|'ac'|'usb'|'wireless'|'dock'|'unknown'` (iOS never reports `ac`/`usb`/`wireless`).
+`PowerSource` `'none'|'ac'|'usb'|'wireless'|'dock'|'unknown'` (iOS never reports `ac`/`usb`/`wireless`) ·
+`GeofenceTransition` `'enter'|'exit'|'dwell'` (`dwell` iOS only) ·
+`LicenseStatus` `'active'|'revoked'|'expired'|'unknownKey'|'invalidKey'|'packageMismatch'|'sdkMismatch'|'unrecognised'` (Android) ·
+`WakeResult` `'alive'|'revived'|'refused'|'noSession'|'disabled'|'dispatched'|'timedOut'|'locationOff'` (Android; `dispatched` is never returned through this package).
 
 ### `TrackerConfig`
 
 Passed to `ready()`. Shared fields are flat; platform-only fields live in the `ios` / `android`
 namespaces. Every field is optional — omit it to keep the SDK default.
+
+Field types follow the naming: a unit suffix (`…Ms`, `…Sec`, `…Min`, `…M`, `…Meters`, `…Deg`,
+`…Days`, `…Rows`, `…Capacity`, `…Steps`, `…G`) is a `number` in that unit; `use…`, `persist…`,
+`enable…`, `show…`, `stopOn…`, `startOn…`, `disable…`, `wait…` and on/off names (`adaptiveCadence`,
+`turnBurst`, `navigationMode`, `activityRecognition`, `cornerAnchorCapture`, `foregroundService`,
+`backgroundLocationIndicator`, `aggressiveOemProfile`, `speedAdaptiveCadence`) are `boolean`;
+`notification…`, `…Event`, `…Id`, `license`, `baseUrl` are `string`. Exceptions: `…ConfidenceMin`
+fields are `number` confidence **minimums** (not minutes), and `maxRecords` is a `number`. Enum-typed fields:
+`trackingMode: TrackingMode`, `desiredAccuracy` / `ios.stationaryAccuracy: DesiredAccuracy`,
+`accuracy.profile: AccuracyProfile`, `mockLocationPolicy: MockPolicy` (default `'flag'`),
+`android.providerType: LocationProviderType`.
 
 | Group | Fields |
 |---|---|
@@ -1570,7 +1946,7 @@ namespaces. Every field is optional — omit it to keep the SDK default.
 | Persistence | `maxDaysToPersist`, `persistRawFixes`, `rawFixRingCapacity`, `persistRawPoints`, `rawPointRingCapacity`, `persistDecisions`, `decisionRetentionDays`, `decisionMaxRows` |
 | Service | `healthLoopMs`, `backstopIntervalMin`, `deadTrackerMovingMin`, `deadTrackerStationaryMin` |
 | `ios` | `backgroundLocationIndicator`, `stillConfidenceMin`, `useSignificantLocationChange`, `useStationaryFence`, `stationaryAccuracy`, `speedAdaptiveCadence`, `targetSpacingM`, `minIntervalMs`, `maxIntervalMs`, `significantMotionSteps`, `significantMotionAccelG`, `significantMotionAccelSustainMs`, `stationaryGeofenceId` (must carry the reserved `tracker-stationary` prefix), `stationaryGeofenceOnExitEvent` |
-| `android` | `providerType`, `fastestIntervalMs`, `maxUpdateDelayMs`, `maxFixAgeMs`, `navigationFastestIntervalMs`, `distanceFilterM`, `waitForAccurateLocation`, `aggressiveOemProfile`, `maxRecords`, `stepBatchLatencyMs`, `stationaryGeofenceId`, `stationaryGeofenceOnEnterEvent`, `stationaryGeofenceOnExitEvent`, `foregroundService`, `stopOnTerminate`, `enableHeadless`, `startOnBoot`, `watchdogIntervalMs`, `watchdogThrottleMs`, `wakeLockMs`, `serviceHeartbeatMin`, `notificationTitle`, `notificationText`, `notificationChannelId`, `notificationChannelName`, `notificationSmallIconResName`, `showSyncStatusInNotification`, `syncNotificationSubText`, `syncNotificationText` |
+| `android` | `baseUrl` (scheme + host; a relative `SyncConfig.url` resolves against it — must be absolute), `providerType`, `fastestIntervalMs`, `maxUpdateDelayMs`, `maxFixAgeMs`, `navigationFastestIntervalMs`, `distanceFilterM`, `waitForAccurateLocation`, `aggressiveOemProfile`, `maxRecords`, `stepBatchLatencyMs`, `stationaryGeofenceId`, `stationaryGeofenceOnEnterEvent`, `stationaryGeofenceOnExitEvent`, `foregroundService`, `stopOnTerminate`, `enableHeadless`, `startOnBoot`, `watchdogIntervalMs`, `watchdogThrottleMs`, `wakeLockMs`, `serviceHeartbeatMin`, `powerReportIntervalMin`, `notificationTitle`, `notificationText`, `notificationChannelId`, `notificationChannelName`, `notificationSmallIconResName`, `showSyncStatusInNotification`, `syncNotificationSubText`, `syncNotificationText` |
 
 Three `android` fields are new at the **1.0.10** pin: `waitForAccurateLocation` and
 `aggressiveOemProfile` trade battery for latency on hardware whose background tracking is *late*
@@ -1578,7 +1954,17 @@ rather than absent, and `serviceHeartbeatMin` is an `AlarmManager` service-reviv
 keeps working on a MIUI/HyperOS app left at *Restricted*, where the `WorkManager` paths do not run
 at all.
 
-Per-field docblocks live in `src/types/config.ts`.
+Documented defaults: `reset` **true** · `cornerAnchorCapture` **true** · `useSignificantMotion` **true** ·
+`useGyroTurnPrediction` **true** · `bearingChangeCaptureDeg` **30** · `mockLocationPolicy` **`'flag'`** ·
+`deliveryStalenessMs` `0` disables · `ios.speedAdaptiveCadence` **false** · `ios.targetSpacingM` **25** ·
+`ios.minIntervalMs` / `ios.maxIntervalMs` **1000 / 60000** · `android.waitForAccurateLocation` **true** ·
+`android.stationaryGeofenceId` **`'fieldtrack-stationary'`** · `android.serviceHeartbeatMin` **15**
+(`0` disables) · `android.showSyncStatusInNotification` **false** · `android.syncNotificationText`
+**`'unsynced {pending} · last upload {age}'`**. Anything not listed keeps the native SDK's default.
+
+Per-field docs (units, validation, platform notes) ship with the package as TypeScript docblocks in
+`node_modules/@fieldtrack360/react-native-tracker/src/types/config.ts` — your editor shows them on
+hover.
 
 ---
 
@@ -1783,6 +2169,15 @@ Fetch-script environment variables (all optional):
 | The notification still says "Tracking active" after setting `notificationTitle` | Either the icon/title config never reached the SDK — `reset: false` on `ready()` keeps the persisted config, so pass `reset: true` — or the app is on a plugin release older than `1.0.4`, whose pinned Android SDK ignored these keys |
 | Notification text is right but the icon is the generic pin | The name in `notificationSmallIconResName` did not resolve. It is a filename in `android/app/src/main/res/drawable/` with no path and no extension; logcat names the one it could not find |
 | Session stops when the app is swiped away | `android.stopOnTerminate` — and check the notification permission: a suppressed foreground-service notification makes the OS more willing to kill the app |
+| Gap of several minutes after a swipe from recents on MIUI/ColorOS/Funtouch/OxygenOS | Those ROMs kill the process after the swipe. From `1.0.18` (Android SDK `1.0.10-alpha09`) the SDK arms a restore ~5 s later and logs the `diagnostic` "task removed from recents during an active session; fast restore armed". It is only that fast with an exact alarm — declare `SCHEDULE_EXACT_ALARM` in your own manifest (on Android 14+ the user must also allow *Alarms & reminders* in app settings). A ROM that treats the swipe as a force stop cancels the alarm too; have the user lock the app in recents |
+| Crash: `ForegroundServiceDidNotStartInTimeException` — "Context.startForegroundService() did not then call Service.startForeground()" | The process started cold to answer the service start and ran out of the ~10 s deadline before the service was constructed. Take WorkManager's initializer off the cold-start path — [Android setup](#android-setup) step 3 — and keep other work out of `Application` attach/`onCreate` |
+| `IllegalStateException: WorkManager is not initialized properly…` in logcat, or a library's background work silently not running | The WorkManager block from [Android setup](#android-setup) step 3 is in the manifest, but `Application` does not implement `Configuration.Provider`, and a library other than the SDK (e.g. Notifee) reached WorkManager first. Add the provider, or remove the block |
+| Tracking stops an hour into a session on an OEM build, no error | Battery policy. `Tracker.android.getBackgroundRestrictions()` — `degraded` is `true` when the app is background-restricted or in the rare/restricted standby bucket. Offer `requestBatteryOptimizationExemption()` / `openBatteryOptimizationSettings()`, see [Battery optimisation](#battery-optimisation--android-only) |
+| Long straight lines on the map, with nothing recorded in between | The process was frozen, killed or in Doze. Look in the session log for `ProcessExit` (`o-kill`, `PACKAGE_UPDATED`) and gaps between `DEVICE_LOCATION` re-inits. Exempt the app from battery optimisation and enable the OEM auto-launch toggle; wire [remote wake](#remote-wake-fcm--android-only); draw time gaps as breaks on your map, not as travel |
+| `unknown_geofence:fieldtrack-stationary`, then minutes with no points while driving | Fixed from `1.0.17` (Android SDK `1.0.10-alpha08`): the stationary wake fence could stay registered with Play Services after the SDK lost its record of it, and the exit was dropped. Upgrade the package |
+| Server sends idle pushes but `last_seen` never moves | Nothing calls `Tracker.android.wake()`, the message has a `notification` block, or it is not high priority. Send data-only, high-priority messages, see [Remote wake (FCM)](#remote-wake-fcm--android-only) |
+| `remote wake: NO_SESSION` in the log | The push arrived, but no session was open. Expected after end of day or sign-out — stop pushing to that device |
+| `remote wake: REFUSED` in the log | The platform refused the foreground-service start — usually a normal-priority message, or an OEM rule. Confirm `"priority": "high"`; the SDK retries on its own restore path |
 | `playServicesUnavailable` | The device has no usable Google Play services; the fused provider is unavailable |
 | Background points arrive in clumps a minute late, then catch up | OS batching, not a dead provider — the default `android.maxUpdateDelayMs` lets the OS hold a fix for a full interval. Set `android.aggressiveOemProfile: true` (Android SDK 1.0.10) for the whole latency trade, or `android.maxUpdateDelayMs: 0` for that half alone. Set `deliveryStalenessMs` to have lateness reported as a `diagnostic` event so you can tell this apart from a provider that has stopped |
 | Nothing recovers the service on MIUI/HyperOS at the *Restricted* battery setting | `JobScheduler` does not run there at all, which takes out `backstopIntervalMin` and the restore worker together. `android.serviceHeartbeatMin` (Android SDK 1.0.10, default 15) is an `AlarmManager` chain on a separate subsystem. Declaring `SCHEDULE_EXACT_ALARM` in your own manifest upgrades it to an exact alarm, which on API 31+ is also what makes it eligible to start the foreground service — the SDK will not declare that permission on your behalf |
@@ -1796,9 +2191,11 @@ Fetch-script environment variables (all optional):
 | `ready()` resolves `backgroundTasksNotRegistered` | The `BGTaskScheduler` launch handlers were never installed — either an identifier is missing from `BGTaskSchedulerPermittedIdentifiers`, or the registration ran after launch. Tracking is unaffected; you lose the advisory 15-minute backstop. `TrackerLaunch.ready()` does this for you, so the fix is to call it as the first statement of `didFinishLaunchingWithOptions` |
 | `ready()` fails outright, but only in debug | The same cause as the row above. A DEBUG build refuses rather than degrading, deliberately, so a missing launch call cannot ship. Release builds never fail for it |
 | No background capture at all, no error | `TrackerLaunch.ready()` is not called from `didFinishLaunchingWithOptions`, or is called after React Native starts |
+| `error: expected '{' in enum` inside `Tracker*.swiftinterface` | Xcode is older than the compiler that built the pinned iOS SDK (Swift 6.4). Update to Xcode 27.1+ |
+| `The iOS Simulator deployment target 'IPHONEOS_DEPLOYMENT_TARGET' is set to 9.0/12.4, but the range of supported deployment target versions is 15.0 to 27.1.x` on a third-party pod (e.g. `RNSVG-RNSVGFilters`, `RNDeviceInfo-RNDeviceInfoPrivacyInfo`) | Not Tracker — Xcode 27 rejects pods below iOS 15.0. In `post_install`, raise every pod target below 15.0 to 15.0 (the sample's Podfile carries the snippet), then `pod install` |
 | `dyld: … MinimumOSVersion` load failure at launch | The app target's `IPHONEOS_DEPLOYMENT_TARGET` is below 17.0. The Podfile `post_install` gate catches this at install time — add it |
 | Crash on first permission prompt | A missing `NSLocation…UsageDescription` / `NSMotionUsageDescription` string |
-| `getCurrentLocation` fails with `oneShotBusy` / `oneShotCircuitOpen` | iOS, and **not retryable**. `oneShotBusy` means a capture is already in flight — await that one. `oneShotCircuitOpen` means three consecutive failures opened the circuit; it closes when authorization is granted, location services return, or a session starts |
+| `getCurrentLocation` fails with `oneShotBusy` / `oneShotCircuitOpen` | iOS, and **not retryable**. `oneShotBusy` means a capture is already in flight — await that one. `oneShotCircuitOpen` means three consecutive failures opened the circuit; it closes when authorization is granted, location services return, a session starts, or `ready()` succeeds — and after 60 s one trial attempt is let through (a failed trial reopens it for another 60 s) |
 | `getCurrentLocation` adds points to the track | iOS only, and by design — the SDK's one-shot feeds the ingestor by default. Android never does this |
 
 ### Licence and configuration
@@ -1828,7 +2225,7 @@ Fetch-script environment variables (all optional):
 | Symptom | Cause / fix |
 |---|---|
 | Everything returns `notReady` | `ready()` was never awaited, or it resolved `{ ok:false }` and the result was swallowed |
-| A subscription never fires | Either it is a platform-only stream (`geofenceDwell`, `geofenceAdded/Removed`), a `SyncEvent` type Android never emits (everything but `httpResponse`), or the unsubscribe ran early — verify the effect's cleanup |
+| A subscription never fires | Either it is a platform-only event (`geofenceDwell`, `licenseDeactivated`, `trackingGap` on iOS; `integrityChange`, `licenseChecked`, `powerReport` on Android), a `SyncEvent` type Android never emits (everything but `httpResponse`), or the unsubscribe ran early — verify the effect's cleanup |
 | Geofence crossings are missing after a relaunch | Crossings delivered to a relaunched process never reach a live JS subscriber. Read `Tracker.geofences.getEvents()` at launch |
 | `geofenceLimitReached` | The usable cap is 19 |
 | `buildTrack` result looks short | The query page came back full — check `track.warnings` for the truncation notice and raise `limit` |
